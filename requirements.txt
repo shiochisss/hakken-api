@@ -4,3 +4,4 @@ gunicorn
 sqlalchemy
 psycopg[binary]
 python-dotenv
+httpx
