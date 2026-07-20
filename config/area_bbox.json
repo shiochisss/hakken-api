@@ -1,0 +1,8 @@
+{
+  "_comment": "エリア矩形フィルタ。enabled=false で無効化＝取得zipの全stopを採用（首都圏拡大方針 2026-07-20）。将来また範囲を絞る場合は enabled=true に。矩形値（練馬駅・江古田駅・光が丘を含む）は温存。",
+  "enabled": false,
+  "lat_min": 35.70,
+  "lat_max": 35.79,
+  "lng_min": 139.58,
+  "lng_max": 139.70
+}

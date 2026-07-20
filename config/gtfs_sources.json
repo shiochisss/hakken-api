@@ -1,0 +1,39 @@
+{
+  "_comment": "GTFS-JP 取得元（社ごとにURL形式が異なるため設定駆動）。{token} と {date} はコードが実行時に差し込む。トークンはここに書かない。requires_date=true の社は download 前に ckan_slug から最新 date を自動解決（gtfs_reader.resolve_date）。date は自動解決失敗時のフォールバック（空可）。ファイル名は社ごとに異なる（AllLines / AIILines / NTBus / *-GTFS）ので変更時は実URL確認。",
+  "seibu": {
+    "url_template": "https://api.odpt.org/api/v4/files/SeibuBus/data/SeibuBus-GTFS.zip?acl:consumerKey={token}"
+  },
+  "toei": {
+    "url_template": "https://api.odpt.org/api/v4/files/Toei/data/ToeiBus-GTFS.zip?acl:consumerKey={token}"
+  },
+  "kanto": {
+    "url_template": "https://api.odpt.org/api/v4/files/odpt/KantoBus/AllLines.zip?date={date}&acl:consumerKey={token}",
+    "requires_date": true,
+    "ckan_slug": "kanto_bus_all_lines",
+    "date": ""
+  },
+  "keio": {
+    "url_template": "https://api.odpt.org/api/v4/files/odpt/KeioBus/AllLines.zip?date={date}&acl:consumerKey={token}",
+    "requires_date": true,
+    "ckan_slug": "keio_bus_all_lines",
+    "date": ""
+  },
+  "odakyu": {
+    "url_template": "https://api.odpt.org/api/v4/files/odpt/OdakyuBus/AIILines.zip?date={date}&acl:consumerKey={token}",
+    "requires_date": true,
+    "ckan_slug": "odakyu_bus_aii_lines",
+    "date": ""
+  },
+  "keisei": {
+    "url_template": "https://api.odpt.org/api/v4/files/odpt/KeiseiTransitBus/AllLines.zip?date={date}&acl:consumerKey={token}",
+    "requires_date": true,
+    "ckan_slug": "keisei_transit_bus_all_lines",
+    "date": ""
+  },
+  "nishitokyo": {
+    "url_template": "https://api.odpt.org/api/v4/files/odpt/NishiTokyoBus/NTBus.zip?date={date}&acl:consumerKey={token}",
+    "requires_date": true,
+    "ckan_slug": "nishi_tokyo_bus_nt_bus",
+    "date": ""
+  }
+}

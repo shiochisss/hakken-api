@@ -1,0 +1,5 @@
+{
+  "_comment": "is_hub ホワイトリスト（仮置き）。正式リストは件数シミュレーション後に差し替える前提（要件13章・DB設計書9章）。match=name_contains は停留所名の部分一致。",
+  "match": "name_contains",
+  "names": ["練馬駅", "光が丘", "江古田駅"]
+}
