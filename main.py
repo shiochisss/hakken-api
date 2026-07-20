@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import config
-from app.routers import auth, me
+from app.routers import auth, conditions, events, favorites, going, me, submissions
 
 app = FastAPI(title="ハッケンバス API")
 
@@ -18,6 +18,11 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(me.router)
+app.include_router(conditions.router)  # F3 楽条件（B-4/B-5）
+app.include_router(favorites.router)   # F6 お気に入り（B-8/B-9）
+app.include_router(going.router)       # F7 ここ行く（B-10）
+app.include_router(events.router)      # 計測イベント（B-14）
+app.include_router(submissions.router)  # F11 たれ込み投稿（B-15）
 
 
 @app.get("/health")
