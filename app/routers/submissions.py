@@ -2,6 +2,11 @@
 
 stores には一切書かない（承認後に運営が手動で反映＝B-17）。写真投稿は B-16 が担当。
 status='pending' で submissions に INSERT するのみ。
+
+【暫定実装】このモジュールは仕様検証・叩き台のための暫定実装。F11（たれ込み投稿）は
+おかむーさん（外部ベンダー）に実装を依頼済みで、納品後に本ファイルと差し替える予定。
+認証契約（get_current_uid 経由で user_id を取得し submitted_by に格納）は技術回答書
+どおりなので、差し替え時もこの契約を必ず維持すること。
 """
 from __future__ import annotations
 
