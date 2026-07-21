@@ -38,6 +38,24 @@ uvicorn main:app --reload --port 8000
 - `--reload` はコード変更時の自動再起動。ローカル開発用。
 - 止めるときは **Ctrl + C**。
 
+### 本番起動（Azure App Service）
+
+本番（`hakken-bus-api` / Production スロット）は、Azure Portal「構成 → スタック設定」の
+**スタートアップコマンド**に次を設定して起動している。
+
+```bash
+gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app --forwarded-allow-ips="*"
+```
+
+- `-k uvicorn.workers.UvicornWorker`：ASGI（FastAPI）を gunicorn 上で動かすワーカー。
+- `--forwarded-allow-ips="*"`：Azure はプロキシで TLS 終端するため、`X-Forwarded-*` を
+  信頼して scheme／クライアントIPを判定させる（Secure Cookie・HTTPS 判定に必須。
+  下記「認証」節の `--proxy-headers` 相当）。
+- `-w 2`：ワーカープロセス数。
+
+> ⚠️ **この設定は Azure Portal の構成でのみ管理されており、リポジトリには反映されない。**
+> スタートアップコマンドを変更したときは、この README も必ず更新すること。
+
 ## 動作確認
 
 起動したまま、ブラウザで次を開く。
@@ -73,7 +91,7 @@ uvicorn main:app --reload --port 8000
 - 保護：`/api/*` は要ログイン（`app/deps.py` の `get_current_uid`）。未認証・期限切れ・退会（`is_deleted`）は401。
 - CSRF：`state` Cookie 照合。オープンリダイレクト防止：`next` は `FRONTEND_ORIGIN` 同一originのみ許可。
 - **DBマイグレーション**：`schema_postgres.sql`（docs）適用後に `db/001_sessions.sql` を流す（`users(id)`参照のため順序必須）。
-- **Azure（本番）注意**：TLSはプロキシ終端のため、Secure Cookie/scheme判定に `--proxy-headers`（uvicorn）等を有効化する。
+- **Azure（本番）注意**：TLSはプロキシ終端のため、Secure Cookie/scheme判定に `--proxy-headers`（uvicorn）等を有効化する（実際の設定は「起動方法 → 本番起動（Azure App Service）」節参照）。
 - テスト：`python -m tests.test_auth`（DB/Google非依存の到達パス＋純関数）。
 
 ## 夜間バッチ（F9：バス停DB生成）
