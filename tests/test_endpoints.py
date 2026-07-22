@@ -102,6 +102,7 @@ def test_requires_auth():
     cases = [
         ("get", "/api/conditions", None),
         ("put", "/api/conditions", _cond().model_dump()),
+        ("get", "/api/mylist", None),
         ("post", "/api/favorites", {"store_id": 1}),
         ("delete", "/api/favorites/1", None),
         ("post", "/api/going", {"store_id": 1}),
