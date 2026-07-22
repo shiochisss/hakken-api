@@ -54,6 +54,10 @@ LUNCH_END_SEC = 16 * 3600     # 16:00（未満）
 LUNCH_LABEL = "10:00-16:00 ※暫定・要共有(9章#7-b)"
 
 # 土日判定は calendar.txt を正とする（#7-a）。calendar_dates.txt の例外（祝日等）は今回見送り。
+# 【既知の制限】土日判定は calendar.txt 方式。calendar_dates.txt のみの
+#   事業者（小田急/odakyu）は土日集合が空になり route_segments が0件になる。
+#   影響は 8停のみ・豊玉エリア無関係のため後回し（MTG確定 2026-07-22）。
+#   対応時は calendar_dates.txt 方式の分岐を追加する。
 WEEKEND_COLS = ("saturday", "sunday")
 
 # 列長ガード（schema_postgres.sql: gtfs_route_id VARCHAR(128) / label VARCHAR(255) / operator VARCHAR(128)）
