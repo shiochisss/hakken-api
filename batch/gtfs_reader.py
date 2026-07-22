@@ -150,10 +150,19 @@ def _find_member(z: zipfile.ZipFile, filename: str) -> str:
     raise RuntimeError(f"{filename} が zip 内に見つかりません: {z.filename}")
 
 
-def read_stops(zip_path: Path) -> Iterator[dict]:
-    """zip 内 stops.txt を1行=dict で返す。GTFS-JP は UTF-8（BOM許容）。"""
+def read_table(zip_path: Path, filename: str) -> Iterator[dict]:
+    """zip 内の任意 GTFS テキスト（stops.txt / routes.txt / trips.txt /
+    stop_times.txt / calendar.txt 等）を1行=dict で返す。GTFS-JP は UTF-8（BOM許容）。
+
+    ファイルが zip 内に無い場合は RuntimeError（呼び出し側で任意/必須を判断）。
+    """
     with zipfile.ZipFile(zip_path) as z:
-        member = _find_member(z, "stops.txt")
+        member = _find_member(z, filename)
         with z.open(member) as raw:
             text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
             yield from csv.DictReader(text)
+
+
+def read_stops(zip_path: Path) -> Iterator[dict]:
+    """zip 内 stops.txt を1行=dict で返す（read_table の薄いラッパ・F9 stops 取込用）。"""
+    yield from read_table(zip_path, "stops.txt")
