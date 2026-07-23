@@ -242,7 +242,7 @@ def _apply_to_db(clean_rows: list[dict]) -> dict:
     """place_id をキーに UPSERT。更新は UPDATE_COLS + updated_at のみ（方針#2/#3）。"""
     from sqlalchemy import MetaData, func, text
     from sqlalchemy.dialects.postgresql import insert
-    from batch.db import get_engine
+    from batch.db import begin
 
     stats = {"insert": 0, "update": 0}
     if not clean_rows:
@@ -250,8 +250,7 @@ def _apply_to_db(clean_rows: list[dict]) -> dict:
 
     md = MetaData()
     stores = _stores_table(md)
-    engine = get_engine()
-    with engine.begin() as conn:
+    with begin() as conn:  # 接続失敗時はパスワードを伏せて再送出（batch/db.py）
         # 新規/更新の内訳（読み取り）：既存 place_id との突合
         existing = {r[0] for r in conn.execute(text("SELECT place_id FROM stores WHERE place_id IS NOT NULL"))}
         pids = [r["place_id"] for r in clean_rows]
@@ -269,6 +268,8 @@ def _apply_to_db(clean_rows: list[dict]) -> dict:
 
 
 def main(csv_path: str, dry_run: bool = False) -> None:
+    from batch.db import log_connection_target
+    log_connection_target()  # 起動時に接続先（本番/ローカル）を必ず表示＝誤投入防止
     path = Path(csv_path)
     if not path.exists():
         raise SystemExit(f"CSV が見つかりません: {path}")

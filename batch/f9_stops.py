@@ -212,6 +212,8 @@ def _apply_hub(conn, hub_cfg: dict) -> int:
 
 
 def main(dry_run: bool = False) -> None:
+    from batch.db import log_connection_target
+    log_connection_target()  # 起動時に接続先（本番/ローカル）を必ず表示＝誤投入防止
     sources = gtfs.load_sources()
     bbox_cfg = _load_json("area_bbox.json")
     # enabled=false（既定）なら bbox=None＝矩形フィルタ無効（全stop採用）
@@ -240,11 +242,10 @@ def main(dry_run: bool = False) -> None:
         return
 
     # 3) DB反映（1トランザクション）
-    from batch.db import get_engine
+    from batch.db import begin
 
     print("== stops 反映 ==")
-    engine = get_engine()
-    with engine.begin() as conn:
+    with begin() as conn:  # 接続失敗時はパスワードを伏せて再送出（batch/db.py）
         for operator, (rows, seen, _t) in parsed.items():
             for i in range(0, len(rows), UPSERT_CHUNK):
                 _upsert(conn, rows[i : i + UPSERT_CHUNK])

@@ -358,15 +358,14 @@ def _delete_stale_routes(conn, operator: str, seen_route_gids: set[str]) -> int:
 def _apply_to_db(parsed: dict) -> dict:
     """routes / route_segments を1トランザクションで反映して統計を返す。"""
     from sqlalchemy import MetaData, text
-    from batch.db import get_engine
+    from batch.db import begin
 
     stats = {"routes_upsert": 0, "routes_deleted": 0, "seg_upsert": 0, "seg_deleted": 0, "seg_skip_no_stop": 0}
     md = MetaData()
     routes_tbl = _routes_table(md)
     seg_tbl = _segments_table(md)
 
-    engine = get_engine()
-    with engine.begin() as conn:
+    with begin() as conn:  # 接続失敗時はパスワードを伏せて再送出（batch/db.py）
         # 1) routes UPSERT（区間に現れた路線のみ＝FK被参照を保証）
         for operator, (routes_map, segments, _t) in parsed.items():
             seen_route_gids = {k[0] for k in segments}
@@ -419,6 +418,8 @@ def _apply_to_db(parsed: dict) -> dict:
 
 
 def main(dry_run: bool = False) -> None:
+    from batch.db import log_connection_target
+    log_connection_target()  # 起動時に接続先（本番/ローカル）を必ず表示＝誤投入防止
     sources = gtfs.load_sources()
     token = gtfs.get_token()
 
