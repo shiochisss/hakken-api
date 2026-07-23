@@ -1,6 +1,6 @@
 """stores 取込バッチ（CSVキュレーション → PostgreSQL）。
 
-hakken-curation が出力する16列CSV（GoogleマップURL→AI構造化）を stores へ UPSERT する。
+hakken-curation が出力する17列CSV（GoogleマップURL→AI構造化）を stores へ UPSERT する。
 F9 / route_segments と同じ設計思想（引数CSV → 検証 → UPSERT → dry-run → サマリ）。
 
 確定方針（2026-07-22 承認）:
@@ -8,14 +8,15 @@ F9 / route_segments と同じ設計思想（引数CSV → 検証 → UPSERT → 
   2) **stale削除はしない**。stores はキュレーションで累積する性質で、1本のCSVは
      「今回分」であり全宇宙ではない。CSVから消えても既存storeは自動削除しない（意図どおり）。
      更新時は業務/人手所有列 status・is_listed を**触らない**（ON CONFLICT の SET から除外）。
-  3) updated_by は **INSERT時のみ 'import' を設定**。UPDATE時は SET に含めない
-     （ops が後から手動修正した履歴を、CSV再取込で上書きしないため）。
+  3) updated_by は **CSV の17列目（値='import'固定）を読み取り、INSERT/UPDATE とも
+     DB に書き込む**（CSVが正＝素直に上書き。2026-07-23 方針変更：旧「UPDATE時保護」を廃止）。
   4) needs_check 行も投入対象に含める（値はDBの needs_check 列に保存。目視は取込外の人手運用）。
   5) CSVパスは引数指定（python -m batch.stores_import <csv_path> [--dry-run]）。
 
 DB側で自動付与（CSVに無い列。手順書E:124）:
-  id（IDENTITY採番）／is_listed（DEFAULT true）／updated_at（DEFAULT now()／更新時 now()）／
-  updated_by（DEFAULT無し → INSERT時にバッチが 'import' を供給）。
+  id（IDENTITY採番）／is_listed（DEFAULT true・CSVに列なし＝人のみ操作で取込は触らない）／
+  updated_at（DEFAULT now()／更新時 now()）。
+  ※updated_by は上記#3のとおり CSV（17列目）由来。
 
 実行:
   python -m batch.stores_import path/to/stores_YYYYMMDD.csv --dry-run   # DB書込なし
@@ -23,8 +24,8 @@ DB側で自動付与（CSVに無い列。手順書E:124）:
 必要な環境変数: DATABASE_URL（本反映時のみ）。dry-run はDB非接続。
 
 方針の根拠:
-  - schema_postgres.sql stores（19列＝CSV16＋id/is_listed/updated_at/updated_by）
-  - 手順書E 6章（DB取込への受け渡し）／hakken-curation/CLAUDE.md（16列スキーマ・空欄運用）
+  - schema_postgres.sql stores（20列＝CSV17＋id/is_listed/updated_at）
+  - 手順書E 6章（DB取込への受け渡し）／hakken-curation/CLAUDE.md（17列スキーマ・空欄運用）
   - DB設計書 4-1（status＝運営手動UPDATEの唯一の業務列／is_listed＝人のみ操作）
 """
 from __future__ import annotations
@@ -37,19 +38,20 @@ from pathlib import Path
 
 UPSERT_CHUNK = 500
 
-# CSV 16列（この順・hakken-curation/CLAUDE.md）
+# CSV 17列（この順・hakken-curation/CLAUDE.md）
 CSV_COLS = [
     "name", "category_l", "category_s", "address", "lat", "lng", "place_id",
     "gmaps_url", "hotpepper_url", "insta_url", "official_url", "area_label",
-    "status", "confidence", "needs_check", "curated_date",
+    "status", "confidence", "needs_check", "curated_date", "updated_by",
 ]
 
 # 必須列（category_s・place_id・各URL・needs_check は任意）
 REQUIRED = ("name", "category_l", "address", "lat", "lng", "gmaps_url",
-            "area_label", "status", "confidence", "curated_date")
+            "area_label", "status", "confidence", "curated_date", "updated_by")
 
 STATUS_ENUM = {"営業中", "一時休業疑い", "閉店疑い", "移転疑い"}
 CONFIDENCE_ENUM = {"高", "中", "低"}
+UPDATED_BY_ENUM = {"import", "ops"}  # DB の CHECK と一致（キュレーションCSVは常に 'import'）
 
 # 列長ガード（schema_postgres.sql の VARCHAR(N)。URL系は TEXT＝無制限）
 MAXLEN = {
@@ -57,11 +59,12 @@ MAXLEN = {
     "place_id": 255, "area_label": 64, "status": 16, "confidence": 2,
 }
 
-# 更新時に上書きしてよい列（status・is_listed・updated_by・place_id・id は除外）
+# 更新時に上書きしてよい列（status・is_listed・place_id・id は除外＝保護）。
+# updated_by は CSV が正＝素直に上書きするため UPDATE_COLS に含める（2026-07-23 方針変更）。
 UPDATE_COLS = (
     "name", "category_l", "category_s", "address", "lat", "lng", "gmaps_url",
     "hotpepper_url", "insta_url", "official_url", "area_label", "confidence",
-    "needs_check", "curated_date",
+    "needs_check", "curated_date", "updated_by",
 )
 
 _TALLY_KEYS = (
@@ -71,6 +74,7 @@ _TALLY_KEYS = (
     "skip_latlng",       # lat/lng が float でない
     "skip_status",       # status が enum 外
     "skip_confidence",   # confidence が enum 外
+    "skip_updated_by",   # updated_by が enum 外（import/ops 以外）
     "skip_date",         # curated_date が日付でない
     "skip_len",          # 列長超過
     "skip_no_place_id",  # place_id 空（UPSERTキー欠）
@@ -96,7 +100,7 @@ def validate_row(row: dict) -> tuple[dict | None, str]:
 
     返り値: (clean|None, status)
       status: ok / skip_required / skip_latlng / skip_status /
-              skip_confidence / skip_date / skip_len / skip_no_place_id
+              skip_confidence / skip_updated_by / skip_date / skip_len / skip_no_place_id
     """
     def g(k: str) -> str:
         return (row.get(k) or "").strip()
@@ -113,6 +117,8 @@ def validate_row(row: dict) -> tuple[dict | None, str]:
         return None, "skip_status"
     if g("confidence") not in CONFIDENCE_ENUM:
         return None, "skip_confidence"
+    if g("updated_by") not in UPDATED_BY_ENUM:
+        return None, "skip_updated_by"
     try:
         cdate = date.fromisoformat(g("curated_date"))
     except ValueError:
@@ -142,7 +148,7 @@ def validate_row(row: dict) -> tuple[dict | None, str]:
         "confidence": g("confidence"),
         "needs_check": g("needs_check") or None,
         "curated_date": cdate,
-        "updated_by": "import",           # INSERT時のみ使用（更新では触らない・方針#3）
+        "updated_by": g("updated_by"),    # CSV値（'import'固定）を INSERT/UPDATE とも書き込む（方針#3）
     }
     return clean, "ok"
 
@@ -179,13 +185,14 @@ def _print_summary(csv_path: Path, tally: dict, conf_dist: Counter,
     print(f"採用可      : {tally['ok']}   （必須充足・enum適合・place_id有）")
     skip_total = (
         tally["skip_no_place_id"] + tally["skip_required"] + tally["skip_status"]
-        + tally["skip_confidence"] + tally["skip_latlng"] + tally["skip_date"] + tally["skip_len"]
+        + tally["skip_confidence"] + tally["skip_updated_by"] + tally["skip_latlng"]
+        + tally["skip_date"] + tally["skip_len"]
     )
     print(
         f"スキップ    : {skip_total}   （place_id空 {tally['skip_no_place_id']} / "
         f"必須欠 {tally['skip_required']} / status不正 {tally['skip_status']} / "
-        f"confidence不正 {tally['skip_confidence']} / lat-lng不正 {tally['skip_latlng']} / "
-        f"日付不正 {tally['skip_date']} / 列長超 {tally['skip_len']}）"
+        f"confidence不正 {tally['skip_confidence']} / updated_by不正 {tally['skip_updated_by']} / "
+        f"lat-lng不正 {tally['skip_latlng']} / 日付不正 {tally['skip_date']} / 列長超 {tally['skip_len']}）"
     )
     print(f"needs_check : {tally['needs_check']} 行（採用可のうち。投入対象＝取込前に人が目視確認する運用メモ）")
     print("confidence  : " + " ".join(f"{k}{v}" for k, v in sorted(conf_dist.items())) or "-")
@@ -195,7 +202,7 @@ def _print_summary(csv_path: Path, tally: dict, conf_dist: Counter,
     else:
         print(
             f"DB反映: 新規INSERT={db_stats['insert']} / 更新UPDATE={db_stats['update']}"
-            f"（更新時 status・is_listed・updated_by は保護＝非更新）"
+            f"（更新時 status・is_listed は保護＝非更新／updated_by は CSV値で上書き）"
         )
 
 
@@ -255,7 +262,7 @@ def _apply_to_db(clean_rows: list[dict]) -> dict:
             stmt = insert(stores).values(clean_rows[i:i + UPSERT_CHUNK])
             set_ = {c: getattr(stmt.excluded, c) for c in UPDATE_COLS}
             set_["updated_at"] = func.now()   # 更新の監査時刻のみ触る
-            # status / is_listed / updated_by は SET に含めない＝既存値を保護
+            # status / is_listed は SET に含めない＝既存値を保護（updated_by は UPDATE_COLS で CSV値上書き）
             stmt = stmt.on_conflict_do_update(index_elements=[stores.c.place_id], set_=set_)
             conn.execute(stmt)
     return stats
@@ -269,7 +276,7 @@ def main(csv_path: str, dry_run: bool = False) -> None:
     header, rows = read_csv_rows(path)
     missing = [c for c in CSV_COLS if c not in header]
     if missing:
-        raise SystemExit(f"CSV に必須列が不足: {missing}（想定16列: {CSV_COLS}）")
+        raise SystemExit(f"CSV に必須列が不足: {missing}（想定17列: {CSV_COLS}）")
 
     clean_rows, tally, conf_dist, status_dist = validate_all(rows)
 
@@ -286,7 +293,7 @@ def main(csv_path: str, dry_run: bool = False) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="stores 取込バッチ（CSV→PostgreSQL・UPSERT）")
-    ap.add_argument("csv_path", help="取込む16列CSVのパス（hakken-curation/output/stores_YYYYMMDD.csv）")
+    ap.add_argument("csv_path", help="取込む17列CSVのパス（hakken-curation/output/stores_YYYYMMDD.csv）")
     ap.add_argument(
         "--dry-run",
         action="store_true",
