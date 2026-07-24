@@ -103,6 +103,7 @@ def test_requires_auth():
         ("get", "/api/conditions", None),
         ("put", "/api/conditions", _cond().model_dump()),
         ("get", "/api/mylist", None),
+        ("get", "/api/search?lat=35.7&lng=139.65&walk_max=15&ride_max=20&total_max=40", None),
         ("post", "/api/favorites", {"store_id": 1}),
         ("delete", "/api/favorites/1", None),
         ("post", "/api/going", {"store_id": 1}),

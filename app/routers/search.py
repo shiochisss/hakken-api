@@ -1,0 +1,210 @@
+"""GET /api/search — 逆引き検索（F4・API設計書 B-6）。
+
+現在地・楽条件から「楽に行ける店」を楽な順で返す。本アプリの心臓。
+
+処理（B-6 の6・7）:
+  1) 現在地から半径R（= walk_max 分に相当する直線距離 = walk_max×80÷1.3 m）内の
+     stops を候補にし、各停の walk1（現在地→乗車停の徒歩分＝直線×1.3÷80）を算出。
+  2) `reach WHERE boarding_stop_id IN (候補)` を1回引き、店×乗車停の到達行を取得。
+  3) walk1+walk2≤walk_max・ride≤ride_max・walk1+ride+walk2≤total_max・transfer で
+     フィルタ（待ち時間は捨象＝到達=walk1+ride+walk2）。
+  4) 店ごとに最小 total の1行に畳む。stores 結合（status='営業中' かつ is_listed=true）。
+  5) photo 解決（hotpepper_url → store_photos の approved/is_primary → none）。
+  6) ORDER BY total → walk1 → store_id。
+  preview=1 は items を省き件数のみ。0件時は relax_suggestions（walk_max+5分の件数）を返す。
+
+TBD（DB設計書9章・確定した暫定値）:
+  - 探索半径R / 第2ソートキー（#10）: R=walk_max×80÷1.3m、同total時 walk1昇順→store_id。
+  - relax_suggestions 算出: 0件時に walk_max+5分での件数を1件返す（初期版）。
+  - category（#12）: 今回は全カテゴリのみ（category は受け取るが未使用）。
+  - SAS URL 発行（#14）: 未実装。store_photos は参照するが own/user の ref は当面 None。
+"""
+from __future__ import annotations
+
+import math
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import text
+
+from app.db import get_engine
+from app.deps import get_current_uid
+
+router = APIRouter()
+
+WALK_DETOUR = 1.3           # 直線→道のり係数（store_stops と同一）
+WALK_SPEED_M_PER_MIN = 80   # 徒歩速度 m/分
+_TRANSFERS = {"none", "hub1"}
+RELAX_WALK_DELTA = 5        # 0件時の緩和提案（walk_max +5分）
+
+# 現在地の妥当域（日本全体をカバー）。範囲外は 400（B-6 は 400 を規定＝Query(ge/le)の422でなく手動400に統一）。
+LAT_MIN, LAT_MAX = 20.0, 46.0
+LNG_MIN, LNG_MAX = 122.0, 154.0
+
+
+def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _walk_min(distance_m: float) -> int:
+    return int(round(distance_m * WALK_DETOUR / WALK_SPEED_M_PER_MIN))
+
+
+def _nearby_walk1(stops: list, lat: float, lng: float, walk_max: int) -> dict[int, int]:
+    """現在地から walk1 ≤ walk_max 分の停 → {stop_id: walk1_min}。"""
+    out: dict[int, int] = {}
+    for sid, slat, slng in stops:
+        w1 = _walk_min(_haversine_m(lat, lng, slat, slng))
+        if w1 <= walk_max:
+            out[sid] = w1
+    return out
+
+
+# ラベル整形など純粋な組み立てはインラインで足りるため関数化しない（既存router同様の素直さ）
+
+
+def _best_by_store(reach_rows, nearby: dict[int, int], walk_max: int, ride_max: int,
+                   total_max: int, transfer: str) -> dict[int, dict]:
+    """到達行を条件でフィルタし、店ごとに最小 total（同点は walk1 昇順）の1行に畳む。"""
+    best: dict[int, dict] = {}
+    for r in reach_rows:
+        # transfer: none 指定なら直行のみ。hub1 指定なら直行＋hub経由の両方可（B-6 SQL準拠）
+        if transfer == "none" and r["transfer"] != "none":
+            continue
+        w1 = nearby.get(r["boarding_stop_id"])
+        if w1 is None:
+            continue
+        if w1 + r["walk2_min"] > walk_max:
+            continue
+        if r["ride_min"] > ride_max:
+            continue
+        total = w1 + r["ride_min"] + r["walk2_min"]
+        if total > total_max:
+            continue
+        cur = best.get(r["store_id"])
+        cand = {"row": r, "walk1": w1, "total": total}
+        if cur is None or (total, w1) < (cur["total"], cur["walk1"]):
+            best[r["store_id"]] = cand
+    return best
+
+
+@router.get("/api/search")
+def search(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    walk_max: int = Query(...),
+    ride_max: int = Query(...),
+    total_max: int = Query(...),
+    transfer: str = Query("none"),
+    category: str | None = Query(None),   # 今回は全カテゴリのみ（未使用・#12確定後に対応）
+    preview: str | None = Query(None),
+    uid: int = Depends(get_current_uid),
+):
+    # バリデーション（違反は 400）。上限は設けない（大きな値でもクエリは破綻しない）。
+    if transfer not in _TRANSFERS:
+        raise HTTPException(status_code=400, detail="invalid transfer")
+    for _name, _v in (("walk_max", walk_max), ("ride_max", ride_max), ("total_max", total_max)):
+        if _v < 1:
+            raise HTTPException(status_code=400, detail=f"{_name} must be >= 1")
+    if not (LAT_MIN <= lat <= LAT_MAX):
+        raise HTTPException(status_code=400, detail="lat out of range")
+    if not (LNG_MIN <= lng <= LNG_MAX):
+        raise HTTPException(status_code=400, detail="lng out of range")
+
+    with get_engine().begin() as conn:
+        stops = [(row["id"], row["lat"], row["lng"])
+                 for row in conn.execute(text("SELECT id, lat, lng FROM stops")).mappings()]
+
+        def run(w_max: int) -> dict[int, dict]:
+            nearby = _nearby_walk1(stops, lat, lng, w_max)
+            if not nearby:
+                return {}
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT r.store_id, r.boarding_stop_id, r.ride_min, r.walk2_min,
+                           r.transfer, r.via_hub_id, r.alight_stop_id, r.route_label,
+                           s.name AS store_name, s.category_l, s.category_s, s.status,
+                           s.address, s.area_label, s.lat AS store_lat, s.lng AS store_lng,
+                           s.gmaps_url, s.hotpepper_url,
+                           bs.name AS boarding_name, als.name AS alight_name, hub.name AS hub_name
+                    FROM reach r
+                    JOIN stores s ON s.id = r.store_id
+                    JOIN stops bs ON bs.id = r.boarding_stop_id
+                    JOIN stops als ON als.id = r.alight_stop_id
+                    LEFT JOIN stops hub ON hub.id = r.via_hub_id
+                    WHERE r.boarding_stop_id = ANY(:ids)
+                      AND s.status = '営業中' AND s.is_listed = true
+                    """
+                ),
+                {"ids": list(nearby.keys())},
+            ).mappings().all()
+            return _best_by_store(rows, nearby, w_max, ride_max, total_max, transfer)
+
+        best = run(walk_max)
+        count = len(best)
+
+        # preview=1 は件数のみ
+        if preview == "1":
+            return {"items": [], "meta": {"count": count, "relax_suggestions": []}}
+
+        # 0件時のみ relax 提案（walk_max +5分での件数）
+        relax: list[dict] = []
+        if count == 0:
+            relaxed = run(walk_max + RELAX_WALK_DELTA)
+            relax = [{"param": "walk_max", "delta": RELAX_WALK_DELTA, "count": len(relaxed)}]
+
+        # photo 解決（対象店の approved/is_primary を1回引く）
+        photo_by_store: dict[int, dict] = {}
+        if best:
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT DISTINCT ON (store_id) store_id, source
+                    FROM store_photos
+                    WHERE status = 'approved' AND is_primary = true AND store_id = ANY(:sids)
+                    ORDER BY store_id, sort_order
+                    """
+                ),
+                {"sids": list(best.keys())},
+            ).mappings():
+                photo_by_store[row["store_id"]] = {"source": row["source"], "ref": None}  # SAS未発行=#14
+
+    # items 組み立て（total → walk1 → store_id 昇順）
+    items = []
+    for store_id, b in sorted(best.items(), key=lambda kv: (kv[1]["total"], kv[1]["walk1"], kv[0])):
+        r = b["row"]
+        hp = r["hotpepper_url"]
+        if hp:
+            photo = {"source": "hotpepper", "ref": hp}
+        elif store_id in photo_by_store:
+            photo = photo_by_store[store_id]         # own/user（ref は SAS 未実装のため None）
+        else:
+            photo = {"source": "none", "ref": None}
+        items.append({
+            "store_id": store_id,
+            "name": r["store_name"],
+            "category_l": r["category_l"],
+            "category_s": r["category_s"],
+            "status": r["status"],
+            "photo": photo,
+            "raku": {
+                "walk1": b["walk1"], "ride": r["ride_min"], "walk2": r["walk2_min"],
+                "total": b["total"], "transfer": r["transfer"],
+                "via_hub": r["hub_name"] if r["transfer"] == "hub1" else None,
+            },
+            "boarding_stop": r["boarding_name"],
+            "alight_stop": r["alight_name"],
+            "route_label": r["route_label"],
+            "address": r["address"],
+            "area_label": r["area_label"],
+            "lat": r["store_lat"],
+            "lng": r["store_lng"],
+            "gmaps_url": r["gmaps_url"],
+        })
+
+    return {"items": items, "meta": {"count": len(items), "relax_suggestions": relax}}
