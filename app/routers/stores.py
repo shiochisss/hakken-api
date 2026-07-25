@@ -48,7 +48,7 @@ def get_store(
                        r.alight_stop_id, r.route_label,
                        s.name AS store_name, s.category_l, s.category_s, s.status,
                        s.address, s.area_label, s.lat AS store_lat, s.lng AS store_lng,
-                       s.gmaps_url, s.hotpepper_url,
+                       s.gmaps_url,
                        bs.name AS boarding_name, bs.lat AS b_lat, bs.lng AS b_lng,
                        als.name AS alight_name, hub.name AS hub_name
                 FROM reach r
@@ -75,24 +75,22 @@ def get_store(
             if best is None or (total, w1) < (best["total"], best["walk1"]):
                 best = {"row": r, "walk1": w1, "total": total}
 
-        # photo: hotpepper_url → store_photos(approved/is_primary) → none（SAS発行は#14で後日・ref=None）
+        # photo: store_photos(approved/is_primary) → none（SAS発行は#14で後日・ref=None）
+        # ※hotpepper_url は「店ページ」のURLで画像ではないため photo.ref には使わない
+        #   （<img src> に入れると必ず読み込み失敗する）。画像URL取得はAPI連携＝別件・未実装。
         row = best["row"]
-        hp = row["hotpepper_url"]
-        if hp:
-            photo = {"source": "hotpepper", "ref": hp}
-        else:
-            prow = conn.execute(
-                text(
-                    """
-                    SELECT source FROM store_photos
-                    WHERE store_id = :sid AND status = 'approved' AND is_primary = true
-                    ORDER BY sort_order
-                    LIMIT 1
-                    """
-                ),
-                {"sid": store_id},
-            ).mappings().first()
-            photo = {"source": prow["source"], "ref": None} if prow else {"source": "none", "ref": None}
+        prow = conn.execute(
+            text(
+                """
+                SELECT source FROM store_photos
+                WHERE store_id = :sid AND status = 'approved' AND is_primary = true
+                ORDER BY sort_order
+                LIMIT 1
+                """
+            ),
+            {"sid": store_id},
+        ).mappings().first()
+        photo = {"source": prow["source"], "ref": None} if prow else {"source": "none", "ref": None}
 
     return {
         "store_id": store_id,

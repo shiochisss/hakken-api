@@ -9,7 +9,10 @@
   3) walk1+walk2≤walk_max・ride≤ride_max・walk1+ride+walk2≤total_max・transfer で
      フィルタ（待ち時間は捨象＝到達=walk1+ride+walk2）。
   4) 店ごとに最小 total の1行に畳む。stores 結合（status='営業中' かつ is_listed=true）。
-  5) photo 解決（hotpepper_url → store_photos の approved/is_primary → none）。
+  5) photo 解決（store_photos の approved/is_primary → none）。
+     ※hotpepper_url は「店ページ」のURLで画像ではないため photo.ref には使わない
+       （<img src> に入れると必ず読み込み失敗する）。ホットペッパーの画像URL取得は
+       API連携が必要＝別件・未実装。
   6) ORDER BY total → walk1 → store_id。
   preview=1 は items を省き件数のみ。0件時は relax_suggestions（walk_max+5分の件数）を返す。
 
@@ -130,7 +133,7 @@ def search(
                            r.transfer, r.via_hub_id, r.alight_stop_id, r.route_label,
                            s.name AS store_name, s.category_l, s.category_s, s.status,
                            s.address, s.area_label, s.lat AS store_lat, s.lng AS store_lng,
-                           s.gmaps_url, s.hotpepper_url,
+                           s.gmaps_url,
                            bs.name AS boarding_name, als.name AS alight_name, hub.name AS hub_name
                     FROM reach r
                     JOIN stores s ON s.id = r.store_id
@@ -178,13 +181,9 @@ def search(
     items = []
     for store_id, b in sorted(best.items(), key=lambda kv: (kv[1]["total"], kv[1]["walk1"], kv[0])):
         r = b["row"]
-        hp = r["hotpepper_url"]
-        if hp:
-            photo = {"source": "hotpepper", "ref": hp}
-        elif store_id in photo_by_store:
-            photo = photo_by_store[store_id]         # own/user（ref は SAS 未実装のため None）
-        else:
-            photo = {"source": "none", "ref": None}
+        # own/user（ref は SAS 未実装のため None）→ 無ければ none。
+        # hotpepper_url は画像URLではないので使わない（上の docstring 5 参照）。
+        photo = photo_by_store.get(store_id, {"source": "none", "ref": None})
         items.append({
             "store_id": store_id,
             "name": r["store_name"],
