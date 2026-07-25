@@ -42,3 +42,20 @@ SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "30"))
 
 def session_max_age_seconds() -> int:
     return SESSION_TTL_DAYS * 24 * 60 * 60
+
+
+# --- Azure Blob Storage（F11 写真アップロード B-16）---
+# 非公開コンテナのみ。SAS は本APIでは発行しない（#14・発注者側の別実装）。
+# 既定は接続文字列方式。Managed Identity を使う場合は
+# AZURE_STORAGE_USE_MANAGED_IDENTITY=true ＋ AZURE_STORAGE_ACCOUNT_URL を設定する。
+# コンテナ名の正式値は未確定（hakken-f11/docs/spec_conflicts.md 矛盾2・3）。
+AZURE_STORAGE_CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
+AZURE_STORAGE_CONTAINER = os.environ.get("AZURE_STORAGE_CONTAINER", "store-photos")
+AZURE_STORAGE_ACCOUNT_URL = os.environ.get("AZURE_STORAGE_ACCOUNT_URL", "")
+AZURE_STORAGE_USE_MANAGED_IDENTITY = (
+    os.environ.get("AZURE_STORAGE_USE_MANAGED_IDENTITY", "false").lower() == "true"
+)
+# 既定 false＝既存コンテナ前提（自動作成の可否は未確定・assumptions_and_tbd.md）
+AZURE_STORAGE_CONTAINER_AUTO_CREATE = (
+    os.environ.get("AZURE_STORAGE_CONTAINER_AUTO_CREATE", "false").lower() == "true"
+)

@@ -1,88 +1,46 @@
 """POST /api/submissions — たれ込み投稿（F11・API設計書 B-15）。
 
-stores には一切書かない（承認後に運営が手動で反映＝B-17）。写真投稿は B-16 が担当。
-status='pending' で submissions に INSERT するのみ。
+storesには一切書き込まない（承認後に運営が手動で反映＝B-17）。写真投稿は B-16 が担当。
+submissionsへ status='pending' のINSERTのみ行う。
 
-【暫定実装】このモジュールは仕様検証・叩き台のための暫定実装。F11（たれ込み投稿）は
-おかむーさん（外部ベンダー）に実装を依頼済みで、納品後に本ファイルと差し替える予定。
-認証契約（get_current_uid 経由で user_id を取得し submitted_by に格納）は技術回答書
-どおりなので、差し替え時もこの契約を必ず維持すること。
+store_id は「型/入力形式が不正→400」「数値だが stores.id に存在しない→404」で統一する
+（RFP/技術回答の一部記載との差異は hakken-f11/docs/spec_conflicts.md 矛盾6 参照）。
+
+出典: hakken-f11 納品物（F11・おかむー）app/routers/submissions.py を無改変で移植し、
+旧・暫定実装（叩き台）を置き換えたもの。認証契約（get_current_uid 経由で user_id を
+取得し submitted_by に格納）は旧実装から維持している。
 """
+
 from __future__ import annotations
 
-import json
-
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import Engine
 
 from app.db import get_engine
 from app.deps import get_current_uid
+from app.repositories.stores_repo import store_exists
+from app.repositories.submissions_repo import insert_submission
+from app.schemas.submission import SubmissionIn, SubmissionOut
 
 router = APIRouter()
 
-_TYPES = {"new_store", "info_edit", "closure_report"}
 
+@router.post("/api/submissions", response_model=SubmissionOut)
+def create_submission(
+    body: SubmissionIn,
+    uid: int = Depends(get_current_uid),
+    engine: Engine = Depends(get_engine),
+) -> SubmissionOut:
+    with engine.begin() as conn:
+        if body.store_id is not None and not store_exists(conn, body.store_id):
+            raise HTTPException(status_code=404, detail="store_id not found")
 
-class SubmissionIn(BaseModel):
-    type: str
-    store_id: int | None = None
-    payload: dict
+        submission_id = insert_submission(
+            conn,
+            type_=body.type,
+            store_id=body.store_id,
+            payload=body.payload,
+            submitted_by=uid,
+        )
 
-
-def _is_gmaps_url(url: str) -> bool:
-    """Google マップ URL 形式のゆるい判定（B-15 節8）。"""
-    return url.startswith("https://") and (
-        "google.com/maps" in url
-        or "maps.google.com" in url
-        or "maps.app.goo.gl" in url
-        or "goo.gl/maps" in url
-    )
-
-
-def validate_submission(type_: str, store_id: int | None, payload: dict) -> None:
-    """B-15 節8 のドメイン検証。違反は ValueError（呼び出し側で 400）。"""
-    if type_ not in _TYPES:
-        raise ValueError("invalid type")
-    if type_ == "new_store":
-        if store_id is not None:
-            raise ValueError("new_store must not have store_id")
-        if not _is_gmaps_url(str(payload.get("gmaps_url", "")).strip()):
-            raise ValueError("gmaps_url required (google maps url)")
-    elif type_ == "info_edit":
-        if store_id is None:
-            raise ValueError("store_id required")
-        if not str(payload.get("comment", "")).strip():
-            raise ValueError("comment required")
-    elif type_ == "closure_report":
-        if store_id is None:
-            raise ValueError("store_id required")
-        if not str(payload.get("reason", "")).strip():
-            raise ValueError("reason required")
-
-
-@router.post("/api/submissions")
-def create_submission(body: SubmissionIn, uid: int = Depends(get_current_uid)):
-    try:
-        validate_submission(body.type, body.store_id, body.payload)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    with get_engine().begin() as conn:
-        # store_id 指定時（info_edit / closure_report）は存在チェック → 404
-        if body.store_id is not None:
-            exists = conn.execute(
-                text("SELECT 1 FROM stores WHERE id = :sid"), {"sid": body.store_id}
-            ).first()
-            if exists is None:
-                raise HTTPException(status_code=404, detail="store not found")
-        row = conn.execute(
-            text(
-                """
-                INSERT INTO submissions (type, store_id, payload, status, submitted_by, created_at)
-                VALUES (:type, :sid, CAST(:payload AS JSONB), 'pending', :uid, now())
-                RETURNING id
-                """
-            ),
-            {"type": body.type, "sid": body.store_id, "payload": json.dumps(body.payload), "uid": uid},
-        ).first()
-    return {"submission_id": int(row[0])}
+    return SubmissionOut(submission_id=submission_id)

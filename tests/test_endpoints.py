@@ -16,10 +16,15 @@ os.environ.setdefault("FRONTEND_ORIGIN", "http://localhost:3000")
 os.environ.setdefault("OAUTH_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
 
 from fastapi.testclient import TestClient  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 from app.routers.conditions import ConditionsIn, validate_conditions  # noqa: E402
-from app.routers.submissions import _is_gmaps_url, validate_submission  # noqa: E402
 from app.routers.events import _EVENT_TYPES  # noqa: E402
+# B-15 の検証は F11 納品版へ差し替え済み。旧 submissions.py の
+# _is_gmaps_url / validate_submission は廃止され、pydantic スキーマ＋
+# services.gmaps_url に移った。
+from app.schemas.submission import SubmissionIn  # noqa: E402
+from app.services.gmaps_url import is_valid_google_maps_url  # noqa: E402
 from main import app  # noqa: E402
 
 client = TestClient(app)
@@ -55,37 +60,63 @@ def test_validate_conditions_out_of_range():
             pass
 
 
-# ---- 純関数：たれ込みの検証（B-15） ----
+# ---- 純関数：たれ込みの検証（B-15・F11 納品版） ----
 
-def test_is_gmaps_url():
-    assert _is_gmaps_url("https://www.google.com/maps/place/x")
-    assert _is_gmaps_url("https://maps.app.goo.gl/abc")
-    assert not _is_gmaps_url("http://google.com/maps")  # https 必須
-    assert not _is_gmaps_url("https://example.com/x")
+def test_is_valid_google_maps_url():
+    assert is_valid_google_maps_url("https://www.google.com/maps/place/x")
+    assert is_valid_google_maps_url("https://maps.app.goo.gl/abc")
+    assert is_valid_google_maps_url("https://maps.google.com/?q=x")
+    assert not is_valid_google_maps_url("http://google.com/maps")   # https 必須
+    assert not is_valid_google_maps_url("https://example.com/x")
+    # ホスト名は完全一致。旧実装（部分文字列一致）が通していた偽装URLを拒否する
+    assert not is_valid_google_maps_url("https://evil.example.com/?x=google.com/maps")
+    assert not is_valid_google_maps_url("https://google.com.evil.test/maps")
+    assert not is_valid_google_maps_url("https://user:pass@maps.google.com/")  # userinfo 拒否
+    assert not is_valid_google_maps_url("https://www.google.com/search?q=x")   # /maps 以外
 
 
-def test_validate_submission_new_store():
-    validate_submission("new_store", None, {"gmaps_url": "https://maps.app.goo.gl/x", "comment": "良い店"})
+def test_submission_new_store():
+    SubmissionIn(
+        type="new_store",
+        store_id=None,
+        payload={"gmaps_url": "https://maps.app.goo.gl/x", "comment": "良い店"},
+    )
     # store_id を付けてはいけない
     _expect_raise("new_store", 5, {"gmaps_url": "https://maps.app.goo.gl/x"})
     # gmaps_url 無し
     _expect_raise("new_store", None, {"comment": "x"})
+    # gmaps_url が Google マップでない
+    _expect_raise("new_store", None, {"gmaps_url": "https://example.com/x"})
 
 
-def test_validate_submission_info_edit_and_closure():
-    validate_submission("info_edit", 10, {"comment": "住所が違う"})
-    validate_submission("closure_report", 10, {"reason": "貼り紙あり"})
+def test_submission_info_edit_and_closure():
+    SubmissionIn(type="info_edit", store_id=10, payload={"comment": "住所が違う"})
+    SubmissionIn(type="closure_report", store_id=10, payload={"reason": "貼り紙あり"})
     _expect_raise("info_edit", None, {"comment": "x"})   # store_id 必須
     _expect_raise("info_edit", 10, {"comment": "  "})     # 本文必須
     _expect_raise("closure_report", 10, {})               # reason 必須
     _expect_raise("bogus_type", 10, {})                   # type 不正
 
 
+def test_submission_rejects_unknown_keys():
+    """extra="forbid"：未知キーは黙って無視せず拒否する（user_id なりすまし対策）。"""
+    # payload 内の未知キー
+    _expect_raise("closure_report", 10, {"reason": "x", "evil": 1})
+    # トップレベルの未知キー（user_id の詐称）
+    try:
+        SubmissionIn(
+            type="closure_report", store_id=10, payload={"reason": "x"}, user_id=999
+        )
+        raise AssertionError("should have raised for unknown top-level key")
+    except ValidationError:
+        pass
+
+
 def _expect_raise(type_, store_id, payload):
     try:
-        validate_submission(type_, store_id, payload)
+        SubmissionIn(type=type_, store_id=store_id, payload=payload)
         raise AssertionError(f"should have raised for {type_}")
-    except ValueError:
+    except ValidationError:
         pass
 
 
@@ -110,6 +141,9 @@ def test_requires_auth():
         ("post", "/api/going", {"store_id": 1}),
         ("post", "/api/events", {"event_type": "app_open"}),
         ("post", "/api/submissions", {"type": "closure_report", "store_id": 1, "payload": {"reason": "x"}}),
+        # B-16 写真アップロード。Depends(get_current_uid) はボディ検証より先に解決されるため、
+        # multipart を付けなくても 401 になる。
+        ("post", "/api/submissions/photo-upload", None),
     ]
     for method, path, body in cases:
         r = getattr(client, method)(path, json=body) if body is not None else getattr(client, method)(path)

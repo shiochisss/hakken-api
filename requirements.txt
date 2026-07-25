@@ -5,3 +5,9 @@ sqlalchemy
 psycopg[binary]
 python-dotenv
 httpx
+# --- F11 写真アップロード（B-16）で追加 ---
+python-multipart
+pillow
+pillow-heif
+azure-storage-blob
+azure-identity
