@@ -7,7 +7,10 @@
   - パス: id（int）／クエリ: lat・lng（必須）。
   - レスポンス: StoreItem（B-6 items と同形。raku・boarding/alight・route_label・photo 含む）。
   - エラー: 401（未認証）／404（存在しない・非配信＝status≠営業中 or is_listed=false）。
-  - 処理: 現在地からの乗車停→当該店の**最小 total 1行**を取得（reach 由来）。副作用なし。到達=walk1+ride+walk2（待ち時間捨象）。
+  - 処理: 現在地からの乗車停→当該店の**最小 total 1行**を取得（reach 由来）。到達=walk1+ride+walk2（待ち時間捨象）。
+  - 副作用: **`sessions` の起点（origin_*）を更新する**（2026-07-27 追加。設計書では「副作用なし」
+    だったが、直後の「ここ行く」が宣言時点の起点を記録できるようにするため。GET が書くのは
+    A-8「GET は冪等」の例外だが、同じ依存が既に last_seen_at を更新している前例に沿う）。
 
 ※「半径R」について: B-7 は walk_max 等の条件を取らないため設計書に R の定義が無い（記載なし）。
   当該店の reach 行は少数のため、**候補を半径で絞らず全 boarding_stop から最小 total を選ぶ**
@@ -20,7 +23,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 
 from app.db import get_engine
-from app.deps import get_current_uid
+from app.deps import CurrentSession, get_current_session
+from app.services import origin as origin_service
 # 徒歩式・座標妥当域は B-6 と同一のものを再利用（walk1 計算の一貫性を担保）
 from app.routers.search import (
     FEW_TRIPS_THRESHOLD, LAT_MAX, LAT_MIN, LNG_MAX, LNG_MIN, _haversine_m, _walk_min,
@@ -34,7 +38,7 @@ def get_store(
     store_id: int,
     lat: float = Query(...),
     lng: float = Query(...),
-    uid: int = Depends(get_current_uid),
+    session: CurrentSession = Depends(get_current_session),
 ):
     # lat/lng 妥当域（B-6 と整合。B-7 error 節には明記なし＝整合目的で 400）
     if not (LAT_MIN <= lat <= LAT_MAX):
@@ -93,6 +97,16 @@ def get_store(
             {"sid": store_id},
         ).mappings().first()
         photo = {"source": prow["source"], "ref": None} if prow else {"source": "none", "ref": None}
+
+        # 起点をセッションに記録する（2026-07-27）。S3 はマウント時に必ずここを呼ぶので、
+        # 直後の「ここ行く」（B-10）が going_list へコピーする起点が最新になる。
+        # レスポンスには載せない（起点の住所を出すのは S2 だけ＝今回のスコープ）。
+        # フォールバック停名は「採用した経路の乗車停」＝厳密な最寄停ではないが、
+        # 住所が解決できたときは使われないため実用上問題にならない。
+        origin_service.save_session_origin(
+            conn, session.sid, lat, lng,
+            origin_service.resolve_origin(lat, lng, row["boarding_name"])["label"],
+        )
 
     return {
         "store_id": store_id,

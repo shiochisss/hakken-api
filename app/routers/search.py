@@ -18,6 +18,10 @@
        （<img src> に入れると必ず読み込み失敗する）。ホットペッパーの画像URL取得は
        API連携が必要＝別件・未実装。
   6) ORDER BY total → walk1 → store_id。
+  7) 起点（現在地）を住所ラベルに解決して `meta.origin` に載せ、`sessions` にも記録する
+     （2026-07-27 追加。S2 の「〈住所〉から探しています」＝実機で「現在地がどこからなのか
+     分からず信ぴょう性が薄い」と指摘されたため）。外部APIは呼ばない＝同梱した町丁目
+     代表点の最寄り探索（`app/services/origin.py`）。**preview=1 のときは行わない**。
   preview=1 は items を省き件数のみ。0件時は relax_suggestions（walk_max+5分の件数）を返す。
 
 TBD（DB設計書9章・確定した暫定値）:
@@ -34,7 +38,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 
 from app.db import get_engine
-from app.deps import get_current_uid
+from app.deps import CurrentSession, get_current_session
+# 球モデルは app/geo.py の1定義を共有する（起点ラベルの最寄り探索とも揃える）。
+# 従来名 _haversine_m / EARTH_R_M で再公開しているので stores.py・arrival.py・テストは無変更。
+from app.geo import EARTH_R_M, haversine_m as _haversine_m
+from app.services import origin as origin_service
 # 「本数少なめ」のしきい値は生成側（バッチ）に定義がある。二重定義を避けて import する。
 from batch.route_segments import FEW_TRIPS_THRESHOLD
 
@@ -48,18 +56,6 @@ RELAX_WALK_DELTA = 5        # 0件時の緩和提案（walk_max +5分）
 # 現在地の妥当域（日本全体をカバー）。範囲外は 400（B-6 は 400 を規定＝Query(ge/le)の422でなく手動400に統一）。
 LAT_MIN, LAT_MAX = 20.0, 46.0
 LNG_MIN, LNG_MAX = 122.0, 154.0
-
-
-EARTH_R_M = 6371000.0  # 球モデルの半径。_haversine_m と _search_bbox で共有する（下記参照）
-
-
-def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    r = EARTH_R_M
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lng2 - lng1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
 
 
 def _walk_min(distance_m: float) -> int:
@@ -92,13 +88,30 @@ def _search_bbox(lat: float, lng: float, walk_max: int) -> dict[str, float]:
 
 
 def _nearby_walk1(stops: list, lat: float, lng: float, walk_max: int) -> dict[int, int]:
-    """現在地から walk1 ≤ walk_max 分の停 → {stop_id: walk1_min}。"""
+    """現在地から walk1 ≤ walk_max 分の停 → {stop_id: walk1_min}。
+
+    stops の要素は (id, lat, lng) 以降を無視する＝4要素目に name が付いていてもよい
+    （起点ラベルのフォールバック用に name も引いているため）。
+    """
     out: dict[int, int] = {}
-    for sid, slat, slng in stops:
+    for st in stops:
+        sid, slat, slng = st[0], st[1], st[2]
         w1 = _walk_min(_haversine_m(lat, lng, slat, slng))
         if w1 <= walk_max:
             out[sid] = w1
     return out
+
+
+def _nearest_stop_name(stops: list, lat: float, lng: float) -> str | None:
+    """現在地に最も近い停の名前。起点の住所が出せなかったときの代替表示に使う。"""
+    best: tuple[float, str] | None = None
+    for st in stops:
+        if len(st) < 4 or not st[3]:
+            continue
+        d = _haversine_m(lat, lng, st[1], st[2])
+        if best is None or d < best[0]:
+            best = (d, st[3])
+    return best[1] if best else None
 
 
 # ラベル整形など純粋な組み立てはインラインで足りるため関数化しない（既存router同様の素直さ）
@@ -140,7 +153,7 @@ def search(
     transfer: str = Query("none"),
     category: str | None = Query(None),   # 今回は全カテゴリのみ（未使用・#12確定後に対応）
     preview: str | None = Query(None),
-    uid: int = Depends(get_current_uid),
+    session: CurrentSession = Depends(get_current_session),
 ):
     # バリデーション（違反は 400）。上限は設けない（大きな値でもクエリは破綻しない）。
     if transfer not in _TRANSFERS:
@@ -154,15 +167,19 @@ def search(
         raise HTTPException(status_code=400, detail="lng out of range")
 
     with get_engine().begin() as conn:
+        # 起点の住所が出せなかったときの代替表示に使う最寄停名（最初の run で1回だけ拾う）
+        nearest_stop: str | None = None
+
         def run(w_max: int) -> dict[int, dict]:
+            nonlocal nearest_stop
             # stops は矩形で一次絞り込みしてから読む（全件ロードしない・_search_bbox 参照）。
             # 円の外周ぶんは余分に返るが、直後の _nearby_walk1 が haversine で正確に落とす。
             stops = [
-                (row["id"], row["lat"], row["lng"])
+                (row["id"], row["lat"], row["lng"], row["name"])
                 for row in conn.execute(
                     text(
                         """
-                        SELECT id, lat, lng FROM stops
+                        SELECT id, lat, lng, name FROM stops
                         WHERE lat BETWEEN :lat_min AND :lat_max
                           AND lng BETWEEN :lng_min AND :lng_max
                         """
@@ -170,6 +187,8 @@ def search(
                     _search_bbox(lat, lng, w_max),
                 ).mappings()
             ]
+            if nearest_stop is None:
+                nearest_stop = _nearest_stop_name(stops, lat, lng)
             nearby = _nearby_walk1(stops, lat, lng, w_max)
             if not nearby:
                 return {}
@@ -199,9 +218,16 @@ def search(
         best = run(walk_max)
         count = len(best)
 
-        # preview=1 は件数のみ
+        # preview=1（S2-b のライブプレビュー）は件数のみ。連打されるので起点の解決・記録も
+        # しない（表示に使わないため不要）。
         if preview == "1":
             return {"items": [], "meta": {"count": count, "relax_suggestions": []}}
+
+        # 起点（現在地）の住所ラベル。S2 の「〈住所〉から探しています」に使い、同時に
+        # セッションにも記録する（「その提案はどこ起点だったか」を後から辿るため）。
+        # 外部APIは呼ばず同梱データの最寄り探索で解決する（app/services/origin.py）。
+        origin = origin_service.resolve_origin(lat, lng, nearest_stop)
+        origin_service.save_session_origin(conn, session.sid, lat, lng, origin["label"])
 
         # 0件時のみ relax 提案（walk_max +5分での件数）
         relax: list[dict] = []
@@ -257,4 +283,7 @@ def search(
             "gmaps_url": r["gmaps_url"],
         })
 
-    return {"items": items, "meta": {"count": len(items), "relax_suggestions": relax}}
+    return {
+        "items": items,
+        "meta": {"count": len(items), "relax_suggestions": relax, "origin": origin},
+    }

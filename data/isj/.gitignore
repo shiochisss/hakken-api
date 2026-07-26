@@ -1,0 +1,4 @@
+# ダウンロードした位置参照情報 zip はコミットしない（生成物 config/oaza_points.json だけを追跡）
+# 再取得は python -m batch.build_oaza_points
+*
+!.gitignore
