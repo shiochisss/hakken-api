@@ -1,5 +1,22 @@
 {
   "_comment": "GTFS-JP 取得元（社ごとにURL形式が異なるため設定駆動）。{token} と {date} はコードが実行時に差し込む。トークンはここに書かない。requires_date=true の社は download 前に ckan_slug から最新 date を自動解決（gtfs_reader.resolve_date）。date は自動解決失敗時のフォールバック（空可）。ファイル名は社ごとに異なる（AllLines / AIILines / NTBus / *-GTFS）ので変更時は実URL確認。",
+  "_removed_2026-07-26": {
+    "odakyu": {
+      "理由": "calendar.txt が無く calendar_dates.txt のみのため土日運行の service_id を判定できず、route_segments が常に0件になる。bbox を東京23区へ拡大した際に停は8→793に増えたが区間は0のままで、『停はあるがバスが来ない』状態が23区西部に広がるだけだった。",
+      "復活の条件": "batch/route_segments.py の weekend_service_ids に calendar_dates.txt 方式の分岐を追加すること（DB設計書 9章#7-a 関連・既知の制限として route_segments.py 冒頭にも記載）。",
+      "url_template": "https://api.odpt.org/api/v4/files/odpt/OdakyuBus/AIILines.zip?date={date}&acl:consumerKey={token}",
+      "requires_date": true,
+      "ckan_slug": "odakyu_bus_aii_lines"
+    },
+    "nishitokyo": {
+      "理由": "西東京バスの営業エリアは多摩地域で、東京23区相当のbbox内に停が0件（拡大前も0件）。ダウンロードとパースの時間だけを消費していた。",
+      "復活の条件": "対象エリアを多摩方面へ広げる場合に戻す。",
+      "url_template": "https://api.odpt.org/api/v4/files/odpt/NishiTokyoBus/NTBus.zip?date={date}&acl:consumerKey={token}",
+      "requires_date": true,
+      "ckan_slug": "nishi_tokyo_bus_nt_bus"
+    }
+  },
+  "_note_kokusai": "国際興業バス（練馬〜江古田の高60系統等）は ODPT・gtfs-data.jp のいずれにも GTFS が存在しない（2026-07-26 に両方を検索して確認）。そのため練馬駅→江古田駅を直接結ぶ経路は本アプリでは表現できない。",
   "seibu": {
     "url_template": "https://api.odpt.org/api/v4/files/SeibuBus/data/SeibuBus-GTFS.zip?acl:consumerKey={token}"
   },
@@ -18,22 +35,10 @@
     "ckan_slug": "keio_bus_all_lines",
     "date": ""
   },
-  "odakyu": {
-    "url_template": "https://api.odpt.org/api/v4/files/odpt/OdakyuBus/AIILines.zip?date={date}&acl:consumerKey={token}",
-    "requires_date": true,
-    "ckan_slug": "odakyu_bus_aii_lines",
-    "date": ""
-  },
   "keisei": {
     "url_template": "https://api.odpt.org/api/v4/files/odpt/KeiseiTransitBus/AllLines.zip?date={date}&acl:consumerKey={token}",
     "requires_date": true,
     "ckan_slug": "keisei_transit_bus_all_lines",
-    "date": ""
-  },
-  "nishitokyo": {
-    "url_template": "https://api.odpt.org/api/v4/files/odpt/NishiTokyoBus/NTBus.zip?date={date}&acl:consumerKey={token}",
-    "requires_date": true,
-    "ckan_slug": "nishi_tokyo_bus_nt_bus",
     "date": ""
   }
 }

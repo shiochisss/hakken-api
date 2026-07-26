@@ -104,9 +104,15 @@ python -m batch.f9_stops --dry-run   # DB書込なしで取得〜パース〜サ
 python -m batch.f9_stops             # 本反映
 ```
 
-- 処理：3社（西武・都営・関東）の GTFS zip を ODPT から取得 → `stops.txt` を
-  エリア矩形＋`location_type=0` でフィルタ → `gtfs_stop_id`（`社:原ID`）をキーに UPSERT
-  → is_hub をホワイトリストで付与。**新規依存なし**（標準ライブラリ＋既存 SQLAlchemy）。
+- 処理：**5社（西武・都営・関東・京王・京成トランジット）** の GTFS zip を ODPT から取得 →
+  `stops.txt` をエリア矩形＋`location_type=0` でフィルタ → `gtfs_stop_id`（`社:原ID`）をキーに
+  UPSERT → is_hub をホワイトリストで付与。**新規依存なし**（標準ライブラリ＋既存 SQLAlchemy）。
+- **エリア矩形**：2026-07-26 に**東京23区相当**へ拡大（`config/area_bbox.json`）。
+  stops 1,491→6,880／route_segments 23,937→108,069／検索応答は約2.2倍（41→102ms・ローカル計測）。
+- **対象から外した社**：小田急（`calendar.txt` 欠落で区間が常に0件）・西東京（23区内に停0件）。
+  経緯と復活条件は `config/gtfs_sources.json` の `"_removed_2026-07-26"` に記録。
+- **国際興業バスは取得不可**：ODPT・gtfs-data.jp のいずれにも GTFS が存在しない（2026-07-26 確認）。
+  練馬駅→江古田駅を直接結ぶ経路（高60系統等）は表現できない。
 - **列長ガード**：DBに入れる前に列長をチェックし長さエラー（PostgreSQL 22001「value too long」）を予防。
   `gtfs_stop_id` は切詰不可のため上限超はスキップ、`name` は上限で切詰（件数はサマリに出力）。
   上限は `batch/f9_stops.py` の `MAX_GTFS_STOP_ID`／`MAX_STOP_NAME`（DDL準拠：PostgreSQL）。

@@ -196,6 +196,37 @@ def _delete_stale(conn, operator: str, seen: set[str]) -> int:
     return res.rowcount or 0
 
 
+def _delete_unconfigured_operators(conn, operators: set[str]) -> int:
+    """gtfs_sources.json から外された社の停を削除する。
+
+    _delete_stale は `gtfs_stop_id LIKE 'operator:%'` で対象社に限定されるため、
+    設定から社を外すとその社の停が永久に残る（2026-07-26 に小田急・西東京を外した際に
+    793停の孤児が発生して判明）。取込対象の社の集合を渡し、それ以外の接頭辞を持つ停を消す。
+
+    store_stops / reach から参照されている停は _delete_stale と同じ条件で保護する
+    （参照が外れた次回の実行で削除される）。
+    """
+    from sqlalchemy import bindparam, text
+
+    if not operators:
+        print("  [警告] 取込対象の社が0件のため、設定外の社の停の削除はスキップ")
+        return 0
+    stmt = text(
+        """
+        DELETE FROM stops s
+        WHERE split_part(s.gtfs_stop_id, ':', 1) NOT IN :ops
+          AND NOT EXISTS (SELECT 1 FROM store_stops ss WHERE ss.stop_id = s.id)
+          AND NOT EXISTS (
+                SELECT 1 FROM reach r
+                WHERE r.boarding_stop_id = s.id
+                   OR r.alight_stop_id = s.id
+                   OR r.via_hub_id = s.id)
+        """
+    ).bindparams(bindparam("ops", expanding=True))
+    res = conn.execute(stmt, {"ops": sorted(operators)})
+    return res.rowcount or 0
+
+
 def _apply_hub(conn, hub_cfg: dict) -> int:
     from sqlalchemy import text
 
@@ -250,6 +281,11 @@ def main(dry_run: bool = False) -> None:
             for i in range(0, len(rows), UPSERT_CHUNK):
                 _upsert(conn, rows[i : i + UPSERT_CHUNK])
             _delete_stale(conn, operator, seen)
+        # 設定（gtfs_sources.json）から外された社の停も掃除する。
+        # 取得に失敗した社は parsed に入らないため、誤って消さないよう sources のキーを使う。
+        n_unconf = _delete_unconfigured_operators(conn, set(sources.keys()))
+        if n_unconf:
+            print(f"  設定外の社の停を削除: {n_unconf} 停")
         hub_count = _apply_hub(conn, hub_cfg)
     _print_summary(parsed, hub_count, failed=failed)
     print("完了")

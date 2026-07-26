@@ -11,8 +11,12 @@ reach.db 生成の前提となる「区間乗車時間」を作る。f9_stops.py
        - calendar.txt を正として「土日に運行する service_id」を抽出（#7-a）。
          calendar_dates.txt（祝日等の例外）は今回見送り。
        - trips.txt で trip_id → (route_id, service_id) を引く。
-       - stop_times.txt を trip 単位・stop_sequence 順に並べ、**隣接停ペア**のみ
-         区間化（#7-c: reach 側が hub 経由で複数区間を組むため細粒度に保つ）。
+       - stop_times.txt を trip 単位・stop_sequence 順に並べ、**同一便の下流全停ペア**を
+         区間化（2026-07-26 変更・DB設計書 9章#16 対応）。
+         ※旧実装は隣接停ペアのみ（#7-c）だった。reach は区間を最大2つしか繋がないため
+           「バスに乗れるのは最大2停」という制約になり、「徒歩20分＋バス1分」のような
+           経路が最短として返っていた。ペア生成は f9_stops と同一の矩形フィルタで
+           **圏内の停に限定**する（圏外停は通過扱い＝所要時間には含まれる）。
        - 「昼」の時間帯（下記 LUNCH_*）に乗車停を出発する便のみ採用（#7-b・暫定）。
        - 同一 (route, 乗車停, 降車停) に集まった複数便の所要秒の **中央値** を代表値に（#7-d）。
        - 24時超え表記（25:10:00 等）は総秒に換算し、時間帯判定は %86400（翌日扱い）。
@@ -35,11 +39,12 @@ reach.db 生成の前提となる「区間乗車時間」を作る。f9_stops.py
 from __future__ import annotations
 
 import argparse
+import json
 import statistics
 from collections import defaultdict
 from pathlib import Path
 
-from batch import gtfs_reader as gtfs
+from batch import f9_stops, gtfs_reader as gtfs
 
 # ============================================================
 # 設定値（マジックナンバーをロジックに埋め込まず、ここで一元管理する）
@@ -54,10 +59,13 @@ LUNCH_END_SEC = 16 * 3600     # 16:00（未満）
 LUNCH_LABEL = "10:00-16:00 ※暫定・要共有(9章#7-b)"
 
 # 土日判定は calendar.txt を正とする（#7-a）。calendar_dates.txt の例外（祝日等）は今回見送り。
-# 【既知の制限】土日判定は calendar.txt 方式。calendar_dates.txt のみの
-#   事業者（小田急/odakyu）は土日集合が空になり route_segments が0件になる。
-#   影響は 8停のみ・豊玉エリア無関係のため後回し（MTG確定 2026-07-22）。
-#   対応時は calendar_dates.txt 方式の分岐を追加する。
+# 【既知の制限】土日判定は calendar.txt 方式。calendar_dates.txt のみの事業者は
+#   土日集合が空になり route_segments が0件になる。
+#   → 該当した小田急（odakyu）は **2026-07-26 に取得対象から外した**。
+#     bbox を東京23区へ拡大した際、停は 8→793 に増えたが区間は0のままで
+#     「停はあるがバスが来ない」状態が広がるだけだったため（経緯は
+#     config/gtfs_sources.json の "_removed_2026-07-26" に記録）。
+#   復活させる場合は weekend_service_ids に calendar_dates.txt 方式の分岐を追加する。
 WEEKEND_COLS = ("saturday", "sunday")
 
 # 列長ガード（schema_postgres.sql: gtfs_route_id VARCHAR(128) / label VARCHAR(255) / operator VARCHAR(128)）
@@ -74,14 +82,27 @@ _TALLY_KEYS = (
     "trip_weekend",      # うち土日便として採用した数
     "skip_no_trip",      # stop_times にあるが trips.txt に無い trip
     "skip_not_weekend",  # 土日でない便
-    "skip_not_lunch",    # 乗車停出発が昼の時間帯外の隣接ペア
-    "skip_time_bad",     # 時刻パース不可の隣接ペア
-    "skip_nonpos",       # 所要が負値・0秒の隣接ペア
-    "skip_no_stop_id",   # stop_id 欠損の隣接ペア
+    "skip_not_lunch",    # 乗車停出発が昼の時間帯外（乗車停単位）
+    "skip_time_bad",     # 時刻パース不可の停
+    "skip_nonpos",       # 所要が負値・0秒のペア
+    "skip_no_stop_id",   # stop_id 欠損の停
+    "skip_out_of_scope",  # stops（F9投入済み）に無い停＝圏外。ペア化の対象外
     "skip_zero_min",     # 中央値が分に丸めると0分になった区間
-    "pair_kept",         # 採用した隣接ペア（集約前）
+    "stops_in_trip",     # 圏内としてペア化に使った停の総数（便ごとの合計）
+    "pair_kept",         # 採用したペア（集約前）
     "segments",          # 集約後の区間数（route,乗車,降車 のユニーク）
 )
+
+
+def load_bbox() -> dict | None:
+    """f9_stops と同一のエリア矩形設定を読む（DB非依存）。
+
+    stops テーブルへ投入された停と同じ圏内判定にするため、同じ config を使う。
+    enabled=false のときは None＝矩形フィルタ無効（全stop採用）。
+    """
+    with open(gtfs.CONFIG_DIR / "area_bbox.json", encoding="utf-8") as f:
+        cfg = json.load(f)
+    return cfg if cfg.get("enabled", False) else None
 
 
 # ============================================================
@@ -166,12 +187,31 @@ def _seq_key(row: dict):
         return (1, v)
 
 
-def build_segments(operator: str, st_rows, trips: dict, weekend: set[str], tally: dict) -> dict:
-    """隣接停ペアの所要秒を集めて中央値で集約し、{(route_gid, 乗車gid, 降車gid): ride_min} を返す。
+def build_segments(
+    operator: str,
+    st_rows,
+    trips: dict,
+    weekend: set[str],
+    tally: dict,
+    in_scope: set[str] | None = None,
+) -> dict:
+    """同一便の「下流にある全停」ペアの所要秒を集め、中央値で集約して
+    {(route_gid, 乗車gid, 降車gid): ride_min} を返す。
+
+    【2026-07-26 変更・DB設計書 9章#16 対応】
+    旧実装は隣接停ペア（`zip(rows, rows[1:])`）のみを区間化していた。reach は区間を
+    最大2つしか繋がない（直行=1区間／hub経由=2区間）ため、**バスに乗れるのが最大2停**
+    という制約になり、「乗車停まで徒歩20分＋バス1分」のような経路が最短として返っていた。
+    本実装では同一便の下流全停へのペアを作り、ride_min は実時刻の差（通過停ぶんを含む）
+    で算出する。これにより「近くの停から数停乗る」経路が選択肢に入る。
 
     - gtfs_stop_id / gtfs_route_id は f9_stops と同じ "operator:原ID" 規則で付与し一貫させる。
+    - in_scope（f9_stops.parse_zip が返す採用停の集合）を渡すと、**圏内の停だけ**でペアを作る。
+      圏外の停は「通過」として扱われ、所要時間には含まれる（実時刻の差で計算するため）。
+      これを渡さないと全国の停で O(n^2) になり破綻するので、本番経路では必ず渡す。
     - 昼フィルタは乗車停の出発時刻（無ければ到着）で判定。
     - ride_min = 降車停の到着 − 乗車停の出発（秒）→ 中央値 → 分へ丸め。
+    - 環状路線で同一停が再登場する便では、同一停どうしのペアは作らない。
     """
     acc: dict[tuple[str, str, str], list[int]] = defaultdict(list)
     for tid, rows in _stop_times_by_trip(st_rows).items():
@@ -185,27 +225,41 @@ def build_segments(operator: str, st_rows, trips: dict, weekend: set[str], tally
             continue
         tally["trip_weekend"] += 1
         rows.sort(key=_seq_key)
-        for a, b in zip(rows, rows[1:]):
-            dep_a = parse_gtfs_time(a.get("departure_time") or a.get("arrival_time"))
-            arr_b = parse_gtfs_time(b.get("arrival_time") or b.get("departure_time"))
-            if dep_a is None or arr_b is None:
+
+        # 便を「圏内の停だけ」の並びに落とす（出発秒・到着秒つき）
+        seq: list[tuple[str, int, int]] = []
+        for r in rows:
+            raw = (r.get("stop_id") or "").strip()
+            if not raw:
+                tally["skip_no_stop_id"] += 1
+                continue
+            gid = f"{operator}:{raw}"
+            if in_scope is not None and gid not in in_scope:
+                tally["skip_out_of_scope"] += 1
+                continue
+            dep = parse_gtfs_time(r.get("departure_time") or r.get("arrival_time"))
+            arr = parse_gtfs_time(r.get("arrival_time") or r.get("departure_time"))
+            if dep is None or arr is None:
                 tally["skip_time_bad"] += 1
                 continue
+            seq.append((gid, dep, arr))
+        tally["stops_in_trip"] += len(seq)
+
+        # 下流の全停ペア（i < j）。ride は実時刻の差なので通過停ぶんも含む。
+        for i, (gid_a, dep_a, _arr_a) in enumerate(seq):
             if not in_lunch_window(dep_a):
                 tally["skip_not_lunch"] += 1
                 continue
-            ride = arr_b - dep_a
-            if ride <= 0:  # 負値・0分は除外（#7-e）
-                tally["skip_nonpos"] += 1
-                continue
-            sa = (a.get("stop_id") or "").strip()
-            sb = (b.get("stop_id") or "").strip()
-            if not sa or not sb:
-                tally["skip_no_stop_id"] += 1
-                continue
-            key = (f"{operator}:{rid}", f"{operator}:{sa}", f"{operator}:{sb}")
-            acc[key].append(ride)
-            tally["pair_kept"] += 1
+            route_gid = f"{operator}:{rid}"
+            for gid_b, _dep_b, arr_b in seq[i + 1:]:
+                if gid_b == gid_a:  # 環状路線で同一停が再登場
+                    continue
+                ride = arr_b - dep_a
+                if ride <= 0:  # 負値・0秒は除外（#7-e）
+                    tally["skip_nonpos"] += 1
+                    continue
+                acc[(route_gid, gid_a, gid_b)].append(ride)
+                tally["pair_kept"] += 1
 
     segments: dict[tuple[str, str, str], int] = {}
     for key, rides in acc.items():
@@ -236,7 +290,13 @@ def process_operator(operator: str, zip_path: Path) -> tuple[dict, dict, dict]:
     trips = load_trips(gtfs.read_table(zip_path, "trips.txt"))
     tally["trips_total"] = len(trips)
 
-    segments = build_segments(operator, gtfs.read_table(zip_path, "stop_times.txt"), trips, weekend, tally)
+    # 圏内の停だけでペアを作るため、f9_stops と同一の矩形フィルタで採用停を求める（DB非依存）。
+    # これを渡さないと下流全停ペアが全国規模の O(n^2) になり破綻する（build_segments の docstring 参照）。
+    _rows, in_scope, _st = f9_stops.parse_zip(operator, zip_path, load_bbox())
+
+    segments = build_segments(
+        operator, gtfs.read_table(zip_path, "stop_times.txt"), trips, weekend, tally, in_scope
+    )
     return routes_map, segments, tally
 
 
@@ -251,9 +311,10 @@ def _truncate(s: str, n: int) -> str:
 def _print_summary(parsed: dict, failed: dict | None, db_stats: dict | None) -> None:
     print("== サマリ（route_segments）==")
     print(f"「昼」時間帯フィルタ = {LUNCH_LABEL}")  # #7-b が仮決めであることを毎回明示
+    print("区間の作り方 = 同一便の下流全停ペア（DB設計書 9章#16 対応・2026-07-26）")
     header = (
-        f"{'社':<10}{'土日SVC':>7}{'便数':>7}{'土日便':>7}"
-        f"{'採用対':>7}{'区間':>7}{'非土日':>7}{'圏外時':>7}{'時刻異':>7}{'非正':>6}"
+        f"{'社':<10}{'土日SVC':>7}{'便数':>7}{'土日便':>7}{'圏内停':>8}"
+        f"{'採用対':>9}{'区間':>8}{'非土日':>8}{'圏外停':>9}{'昼外':>7}{'非正':>7}"
     )
     print(header)
     total_seg = 0
@@ -261,8 +322,9 @@ def _print_summary(parsed: dict, failed: dict | None, db_stats: dict | None) -> 
         total_seg += t["segments"]
         print(
             f"{operator:<10}{t['weekend_services']:>7}{t['trips_total']:>7}{t['trip_weekend']:>7}"
-            f"{t['pair_kept']:>7}{t['segments']:>7}{t['skip_not_weekend']:>7}"
-            f"{t['skip_not_lunch']:>7}{t['skip_time_bad']:>7}{t['skip_nonpos']:>6}"
+            f"{t['stops_in_trip']:>8}{t['pair_kept']:>9}{t['segments']:>8}"
+            f"{t['skip_not_weekend']:>8}{t['skip_out_of_scope']:>9}"
+            f"{t['skip_not_lunch']:>7}{t['skip_nonpos']:>7}"
         )
     print(f"{'合計区間':<10}{total_seg:>21}")
     if failed:
@@ -325,16 +387,19 @@ def _upsert_segments(conn, seg_tbl, rows: list[dict]) -> None:
     conn.execute(stmt)
 
 
-def _delete_stale_segments(conn, seg_tbl, op_route_pks: list[int], seen_keys: list[tuple]) -> int:
-    """この社の路線に属する route_segments のうち、今回生成しなかった複合キーを削除。"""
-    from sqlalchemy import delete, tuple_
+def _delete_segments_of_routes(conn, seg_tbl, op_route_pks: list[int]) -> int:
+    """この社の路線に属する route_segments を全削除する（INSERT の直前に呼ぶ＝全量再生成）。
+
+    【2026-07-26 変更】旧実装は「今回生成しなかった複合キーだけを削除」する方式で、
+    `tuple_(...).notin_(seen_keys)` に生成済みキーを全件バインドしていた。下流全停ペアへの
+    拡張（9章#16）で区間が1万件超になり、**PostgreSQL のバインドパラメータ上限**
+    （65,535）を超えて失敗した。該当社の区間を消してから入れ直す方式に変更する。
+    区間は毎回全量生成されるため、結果は従来と同じ（同一トランザクション内で完結）。
+    """
+    from sqlalchemy import delete
     if not op_route_pks:
         return 0
     stmt = delete(seg_tbl).where(seg_tbl.c.route_id.in_(op_route_pks))
-    if seen_keys:
-        stmt = stmt.where(
-            tuple_(seg_tbl.c.route_id, seg_tbl.c.boarding_stop_id, seg_tbl.c.alight_stop_id).notin_(seen_keys)
-        )
     return conn.execute(stmt).rowcount or 0
 
 
@@ -403,13 +468,13 @@ def _apply_to_db(parsed: dict) -> dict:
                     "route_id": rpk, "boarding_stop_id": bpk,
                     "alight_stop_id": apk, "ride_min": ride_min,
                 })
+            # 全量再生成：この社の区間を削除してから INSERT する（削除→投入の順序が必須）
+            op_route_pks = [pk for gid, pk in route_id_map.items() if gid.startswith(f"{operator}:")]
+            stats["seg_deleted"] += _delete_segments_of_routes(conn, seg_tbl, op_route_pks)
+
             for i in range(0, len(seg_rows), UPSERT_CHUNK):
                 _upsert_segments(conn, seg_tbl, seg_rows[i:i + UPSERT_CHUNK])
             stats["seg_upsert"] += len(seg_rows)
-
-            op_route_pks = [pk for gid, pk in route_id_map.items() if gid.startswith(f"{operator}:")]
-            seen_keys = [(r["route_id"], r["boarding_stop_id"], r["alight_stop_id"]) for r in seg_rows]
-            stats["seg_deleted"] += _delete_stale_segments(conn, seg_tbl, op_route_pks, seen_keys)
 
             seen_route_gids = {k[0] for k in segments}
             stats["routes_deleted"] += _delete_stale_routes(conn, operator, seen_route_gids)
