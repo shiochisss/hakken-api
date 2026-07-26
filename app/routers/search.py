@@ -109,7 +109,8 @@ def _best_by_store(reach_rows, nearby: dict[int, int], walk_max: int, ride_max: 
     """到達行を条件でフィルタし、店ごとに最小 total（同点は walk1 昇順）の1行に畳む。"""
     best: dict[int, dict] = {}
     for r in reach_rows:
-        # transfer: none 指定なら直行のみ。hub1 指定なら直行＋hub経由の両方可（B-6 SQL準拠）
+        # transfer: none 指定なら直行のみ。hub1 指定なら直行＋乗換1回の両方可（B-6 SQL準拠）。
+        # ※値名は hub1 のままだが意味は「乗換1回」。乗換停は任意の停（2026-07-26・batch/reach.py 参照）
         if transfer == "none" and r["transfer"] != "none":
             continue
         w1 = nearby.get(r["boarding_stop_id"])

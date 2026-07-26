@@ -122,13 +122,20 @@ python -m batch.f9_stops             # 本反映
   `config/hub_stops.json`（is_hub）／`config/gtfs_sources.json`（取得元URL・社別）。
 - 取得した zip は `data/gtfs/`（Git管理外）に置かれる。
 - **「本数少なめ」（trip_count）**：`route_segments.trip_count` に**その区間を土日10:00-16:00に走る便数**を
-  持たせ、`reach.min_trip_count`（hub経由は2区間の最小値）を経由して API が `few_trips: bool` を返す。
+  持たせ、`reach.min_trip_count`（乗換ありは2区間の最小値）を経由して API が `few_trips: bool` を返す。
   検索からは**除外せず**、S2カード・S3詳細で「🚌 本数少なめ」バッジとして開示する（2026-07-26 判断。
   除外すると練馬駅起点で江古田の3店が消え、掲載16店に対して損失が大きいため）。
   しきい値は `batch/route_segments.py` の `FEW_TRIPS_THRESHOLD`（**2本未満・暫定**）。
-  `reach` の同点時の優先順は「最短 → 直行 → 便数が多い」。
+- **reach の経路モデル**（2026-07-26 改訂・DB設計書9章#16）：直行（1区間）＋**乗換1回**（2区間）。
+  **乗換停は任意の停**。旧実装は `is_hub` の停に限っていたが、実測でホワイトリストが狭すぎて
+  **到達できる乗車停を1停も増やしていなかった**（713停のまま）。開放すると1,200停になり、
+  江古田駅起点・歩かない条件でヒットが3店→8店に増える。`stops.is_hub` は残るが reach は参照しない。
+  経路の優先順は「**ペナルティ込みの最短 → 直行 → 便数が多い**」。乗換ペナルティは
+  `batch/reach.py` の `TRANSFER_PENALTY_MIN`（**3分・暫定**）で、**選択にだけ効き `ride_min` には
+  含めない**（待ち時間を捨象しているモデルで「1分早いだけの乗換」が直行に勝つのを防ぐため）。
 - テスト：`python -m tests.test_f9_stops`（stops パース層）／
-  `python -m tests.test_route_segments`（区間・便数・reach の純関数）。いずれも DB/ネットワーク不要。
+  `python -m tests.test_route_segments`（区間・便数・reach の純関数）／
+  `python -m tests.test_search_bbox`（検索の stops 一次絞り込み）。いずれも DB/ネットワーク不要。
 
 ## 業務API（F3楽条件／F6お気に入り／F7ここ行く／計測／F11たれ込み）
 

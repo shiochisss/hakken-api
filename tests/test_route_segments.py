@@ -100,28 +100,45 @@ def test_reach_direct_carries_trip_count():
     rows, _t = rc.build_reach(
         store_stops={100: [(1, 5)]},                       # 店100 の降車停=1・徒歩5分
         seg_by_alight={1: [(2, 10, 900, 7)]},              # 停2 →10分→ 停1（路線900・7便）
-        hubs=set(),
         route_label={900: "テスト行き"},
     )
     assert len(rows) == 1
     assert rows[0]["min_trip_count"] == 7
+    assert rows[0]["transfer"] == "none" and rows[0]["via_hub_id"] is None
 
 
-def test_reach_hub_takes_minimum():
-    """hub経由は2区間の便数の最小値（＝経路全体のボトルネック）。"""
+def test_reach_transfer_at_any_stop():
+    """乗換停は任意の停でよい（2026-07-26・9章#16）。以前は is_hub の停に限られていた。"""
     rows, _t = rc.build_reach(
         store_stops={100: [(1, 5)]},
         seg_by_alight={
-            1: [(9, 10, 900, 8)],    # hub9 →10分→ 停1（8便）
-            9: [(2, 6, 901, 3)],     # 停2 →6分→ hub9（3便）
+            1: [(9, 10, 900, 8)],    # 停9 →10分→ 停1（8便）※hub ではない普通の停
+            9: [(2, 6, 901, 3)],     # 停2 →6分→ 停9（3便）
         },
-        hubs={9},
         route_label={900: "2本目", 901: "1本目"},
     )
-    hub_rows = [r for r in rows if r["transfer"] == "hub1"]
-    assert len(hub_rows) == 1
-    assert hub_rows[0]["min_trip_count"] == 3    # min(3, 8)
-    assert hub_rows[0]["route_label"] == "1本目"  # 表示は乗車する1本目
+    tr = [r for r in rows if r["transfer"] == "hub1"]
+    assert len(tr) == 1
+    assert tr[0]["boarding_stop_id"] == 2 and tr[0]["via_hub_id"] == 9
+    assert tr[0]["ride_min"] == 16                 # 6+10。ペナルティは ride に含めない
+    assert tr[0]["min_trip_count"] == 3            # min(3, 8)＝ボトルネック
+    assert tr[0]["route_label"] == "1本目"          # 表示は乗車する1本目
+
+
+def test_reach_does_not_search_two_transfers():
+    """乗換2回（3区間）は探索しない＝MAX_SEGMENTS=2。"""
+    rows, _t = rc.build_reach(
+        store_stops={100: [(1, 5)]},
+        seg_by_alight={
+            1: [(9, 5, 900, 5)],     # 停9 → 停1
+            9: [(8, 5, 901, 5)],     # 停8 → 停9   （ここまでは乗換1回で到達可）
+            8: [(7, 5, 902, 5)],     # 停7 → 停8   （3区間目＝到達しないはず）
+        },
+        route_label={900: "3", 901: "2", 902: "1"},
+    )
+    boardings = {r["boarding_stop_id"] for r in rows}
+    assert boardings == {9, 8}       # 停7 は含まれない
+
 
 
 def test_reach_tiebreak_prefers_more_trips():
@@ -132,7 +149,6 @@ def test_reach_tiebreak_prefers_more_trips():
             1: [(50, 10, 900, 1)],   # 停50 →10分→ 停1（1便）
             2: [(50, 10, 901, 9)],   # 停50 →10分→ 停2（9便）… total は同じ
         },
-        hubs=set(),
         route_label={900: "少ない方", 901: "多い方"},
     )
     assert len(rows) == 1                       # (乗車停50, 店100) で1行に畳まれる
@@ -148,26 +164,57 @@ def test_reach_shortest_still_wins_over_trip_count():
             1: [(50, 8, 900, 1)],    # 8分・1便 ← 短いので勝つ
             2: [(50, 20, 901, 40)],  # 20分・40便
         },
-        hubs=set(),
         route_label={900: "短い方", 901: "本数は多いが遅い"},
     )
     assert rows[0]["route_label"] == "短い方"
     assert rows[0]["min_trip_count"] == 1
 
 
-def test_reach_direct_preferred_over_hub_on_tie():
-    """既存ルールの回帰確認：total 同点なら直行が hub経由に優先する。"""
+def test_reach_direct_preferred_over_transfer_on_tie():
+    """既存ルールの回帰確認：所要が同点なら直行が乗換に優先する。"""
     rows, _t = rc.build_reach(
         store_stops={100: [(1, 5)]},
         seg_by_alight={
-            1: [(2, 10, 900, 5), (9, 4, 902, 5)],  # 直行(停2→10分) と hub9→停1(4分)
-            9: [(2, 6, 901, 5)],                    # 停2 →6分→ hub9  ＝ 合計10分で同点
+            1: [(2, 10, 900, 5), (9, 4, 902, 5)],  # 直行(停2→10分) と 停9→停1(4分)
+            9: [(2, 6, 901, 5)],                    # 停2 →6分→ 停9  ＝ 合計10分で同点
         },
-        hubs={9},
-        route_label={900: "直行", 901: "hub1本目", 902: "hub2本目"},
+        route_label={900: "直行", 901: "1本目", 902: "2本目"},
     )
     row = [r for r in rows if r["boarding_stop_id"] == 2][0]
     assert row["transfer"] == "none"
+
+
+def test_transfer_penalty_lets_slower_direct_win():
+    """乗換ペナルティ：わずかに速いだけの乗換は直行に負ける。
+
+    直行22分 vs 乗換20分 → 20 + TRANSFER_PENALTY_MIN(3) = 23 > 22 で直行が残る。
+    ペナルティが無いと乗換が勝ってしまい、待ち時間を捨象している本アプリでは実態とズレる。
+    """
+    assert rc.TRANSFER_PENALTY_MIN == 3   # 前提が変わったらこのテストの数値も見直す
+    rows, _t = rc.build_reach(
+        store_stops={100: [(1, 0)]},
+        seg_by_alight={
+            1: [(2, 22, 900, 5), (9, 12, 902, 5)],  # 直行(停2→22分) と 停9→停1(12分)
+            9: [(2, 8, 901, 5)],                     # 停2 →8分→ 停9 ＝ 乗換なら20分
+        },
+        route_label={900: "直行22分", 901: "乗換20分"},
+    )
+    row = [r for r in rows if r["boarding_stop_id"] == 2][0]
+    assert row["transfer"] == "none" and row["ride_min"] == 22
+
+
+def test_transfer_penalty_keeps_transfer_only_routes():
+    """直行が存在しない経路は、ペナルティを足しても乗換のまま残る（店を落とさない）。"""
+    rows, _t = rc.build_reach(
+        store_stops={100: [(1, 0)]},
+        seg_by_alight={
+            1: [(9, 12, 902, 5)],    # 停1 へ来るのは停9 からだけ
+            9: [(2, 8, 901, 5)],     # 停2 →8分→ 停9
+        },
+        route_label={901: "1本目", 902: "2本目"},
+    )
+    row = [r for r in rows if r["boarding_stop_id"] == 2][0]
+    assert row["transfer"] == "hub1" and row["ride_min"] == 20  # 実値。ペナルティは含まない
 
 
 def main():
