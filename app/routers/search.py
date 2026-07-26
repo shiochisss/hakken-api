@@ -5,6 +5,10 @@
 処理（B-6 の6・7）:
   1) 現在地から半径R（= walk_max 分に相当する直線距離 = walk_max×80÷1.3 m）内の
      stops を候補にし、各停の walk1（現在地→乗車停の徒歩分＝直線×1.3÷80）を算出。
+     ※stops は **SQL 側で矩形（_search_bbox）に絞ってから読む**。以前は毎リクエストで
+       全件（23区拡大後は 6,087 停）をロードしており、これが応答時間の主要因だった。
+       矩形は円を包むだけの一次絞り込みで、円の判定は従来どおり haversine が行う
+       ＝結果は全件ロード時と完全に一致する（tests/test_search_bbox.py で担保）。
   2) `reach WHERE boarding_stop_id IN (候補)` を1回引き、店×乗車停の到達行を取得。
   3) walk1+walk2≤walk_max・ride≤ride_max・walk1+ride+walk2≤total_max・transfer で
      フィルタ（待ち時間は捨象＝到達=walk1+ride+walk2）。
@@ -46,8 +50,11 @@ LAT_MIN, LAT_MAX = 20.0, 46.0
 LNG_MIN, LNG_MAX = 122.0, 154.0
 
 
+EARTH_R_M = 6371000.0  # 球モデルの半径。_haversine_m と _search_bbox で共有する（下記参照）
+
+
 def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    r = 6371000.0
+    r = EARTH_R_M
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lng2 - lng1)
@@ -57,6 +64,31 @@ def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 def _walk_min(distance_m: float) -> int:
     return int(round(distance_m * WALK_DETOUR / WALK_SPEED_M_PER_MIN))
+
+
+def _search_bbox(lat: float, lng: float, walk_max: int) -> dict[str, float]:
+    """walk1 ≤ walk_max 分と判定されうる停を**必ず含む**緯度経度の矩形を返す。
+
+    stops を SQL 側で一次絞り込みするために使う（23区拡大で 1,491→6,087 停になり、
+    毎リクエストの全件ロードが検索応答の主要因になっていた・DB設計書9章）。
+    絞り込みはあくまで一次で、正確な円の判定は従来どおり _nearby_walk1 が haversine で行う。
+    したがって**矩形が円を包んでさえいれば結果は全件ロードと完全に一致する**。
+
+    包む条件は2つ:
+      1) 半径は (walk_max + 0.5) 分ぶんを使う。_walk_min は四捨五入なので、
+         「walk_max 分」と判定される最大距離は walk_max 分ちょうどより 0.5 分ぶん遠い。
+      2) 度への換算は _haversine_m と同じ球（EARTH_R_M）で行う。別の地球モデルを使うと
+         円と矩形が微妙にズレて、境界の停を取りこぼしうる。
+    """
+    r_m = (walk_max + 0.5) * WALK_SPEED_M_PER_MIN / WALK_DETOUR
+    m_per_deg = math.radians(1.0) * EARTH_R_M       # 緯度1度あたりのメートル
+    dlat = r_m / m_per_deg
+    # 経度1度の長さは cos(緯度) に比例して縮む＝高緯度ほど dlng は大きくなる。矩形の南北端の
+    # うち cos が小さい方（＝dlng が大きい方）を採らないと、その端で矩形が足りなくなる。
+    cos_min = min(abs(math.cos(math.radians(lat + dlat))), abs(math.cos(math.radians(lat - dlat))))
+    dlng = 180.0 if cos_min < 1e-9 else min(180.0, r_m / (m_per_deg * cos_min))  # 極付近の0除算よけ
+    return {"lat_min": lat - dlat, "lat_max": lat + dlat,
+            "lng_min": lng - dlng, "lng_max": lng + dlng}
 
 
 def _nearby_walk1(stops: list, lat: float, lng: float, walk_max: int) -> dict[int, int]:
@@ -121,10 +153,22 @@ def search(
         raise HTTPException(status_code=400, detail="lng out of range")
 
     with get_engine().begin() as conn:
-        stops = [(row["id"], row["lat"], row["lng"])
-                 for row in conn.execute(text("SELECT id, lat, lng FROM stops")).mappings()]
-
         def run(w_max: int) -> dict[int, dict]:
+            # stops は矩形で一次絞り込みしてから読む（全件ロードしない・_search_bbox 参照）。
+            # 円の外周ぶんは余分に返るが、直後の _nearby_walk1 が haversine で正確に落とす。
+            stops = [
+                (row["id"], row["lat"], row["lng"])
+                for row in conn.execute(
+                    text(
+                        """
+                        SELECT id, lat, lng FROM stops
+                        WHERE lat BETWEEN :lat_min AND :lat_max
+                          AND lng BETWEEN :lng_min AND :lng_max
+                        """
+                    ),
+                    _search_bbox(lat, lng, w_max),
+                ).mappings()
+            ]
             nearby = _nearby_walk1(stops, lat, lng, w_max)
             if not nearby:
                 return {}
