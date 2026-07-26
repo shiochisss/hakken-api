@@ -121,8 +121,14 @@ python -m batch.f9_stops             # 本反映
 - 設定（値は仮置き・後で差し替え）：`config/area_bbox.json`（エリア矩形）／
   `config/hub_stops.json`（is_hub）／`config/gtfs_sources.json`（取得元URL・社別）。
 - 取得した zip は `data/gtfs/`（Git管理外）に置かれる。
-- テスト：`python -m tests.test_f9_stops`（パース層・DB/ネットワーク不要）。
-- `routes`／`route_segments` の取込は後続で追加予定。
+- **「本数少なめ」（trip_count）**：`route_segments.trip_count` に**その区間を土日10:00-16:00に走る便数**を
+  持たせ、`reach.min_trip_count`（hub経由は2区間の最小値）を経由して API が `few_trips: bool` を返す。
+  検索からは**除外せず**、S2カード・S3詳細で「🚌 本数少なめ」バッジとして開示する（2026-07-26 判断。
+  除外すると練馬駅起点で江古田の3店が消え、掲載16店に対して損失が大きいため）。
+  しきい値は `batch/route_segments.py` の `FEW_TRIPS_THRESHOLD`（**2本未満・暫定**）。
+  `reach` の同点時の優先順は「最短 → 直行 → 便数が多い」。
+- テスト：`python -m tests.test_f9_stops`（stops パース層）／
+  `python -m tests.test_route_segments`（区間・便数・reach の純関数）。いずれも DB/ネットワーク不要。
 
 ## 業務API（F3楽条件／F6お気に入り／F7ここ行く／計測／F11たれ込み）
 

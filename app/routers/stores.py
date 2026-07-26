@@ -22,7 +22,9 @@ from sqlalchemy import text
 from app.db import get_engine
 from app.deps import get_current_uid
 # 徒歩式・座標妥当域は B-6 と同一のものを再利用（walk1 計算の一貫性を担保）
-from app.routers.search import LAT_MAX, LAT_MIN, LNG_MAX, LNG_MIN, _haversine_m, _walk_min
+from app.routers.search import (
+    FEW_TRIPS_THRESHOLD, LAT_MAX, LAT_MIN, LNG_MAX, LNG_MIN, _haversine_m, _walk_min,
+)
 
 router = APIRouter()
 
@@ -45,7 +47,7 @@ def get_store(
             text(
                 """
                 SELECT r.boarding_stop_id, r.ride_min, r.walk2_min, r.transfer, r.via_hub_id,
-                       r.alight_stop_id, r.route_label,
+                       r.alight_stop_id, r.route_label, r.min_trip_count,
                        s.name AS store_name, s.category_l, s.category_s, s.status,
                        s.address, s.area_label, s.lat AS store_lat, s.lng AS store_lng,
                        s.gmaps_url,
@@ -104,6 +106,8 @@ def get_store(
             "total": best["total"], "transfer": row["transfer"],
             "via_hub": row["hub_name"] if row["transfer"] == "hub1" else None,
         },
+        # B-6 と同じ判定（few_trips の意味は search.py のコメント参照）
+        "few_trips": row["min_trip_count"] is not None and row["min_trip_count"] < FEW_TRIPS_THRESHOLD,
         "boarding_stop": row["boarding_name"],
         "alight_stop": row["alight_name"],
         "route_label": row["route_label"],

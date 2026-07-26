@@ -68,6 +68,14 @@ LUNCH_LABEL = "10:00-16:00 ※暫定・要共有(9章#7-b)"
 #   復活させる場合は weekend_service_ids に calendar_dates.txt 方式の分岐を追加する。
 WEEKEND_COLS = ("saturday", "sunday")
 
+# ★★★ 「本数少なめ」のしきい値は暫定で 2本未満（2026-07-26 ibes 判断）。★★★
+#   母数は「土日の LUNCH_START_SEC〜LUNCH_END_SEC に乗車停を出発する便」＝ trip_count。
+#   下流全停ペア化（9章#16）の副作用で、長い区間は通しで走る便しか該当せず、
+#   店へ到達できる区間に絞ると 1本の割合が 12.5%（全区間では 3.0%）に上がる。
+#   除外はせず「🚌 本数少なめ」バッジで開示する方針（引き継ぎ資料4章）。
+#   判定を行うのは API 側（app/routers/search.py）だが、定数の定義はここ1箇所に置く。
+FEW_TRIPS_THRESHOLD = 2
+
 # 列長ガード（schema_postgres.sql: gtfs_route_id VARCHAR(128) / label VARCHAR(255) / operator VARCHAR(128)）
 MAX_GTFS_ROUTE_ID = 128
 MAX_ROUTE_LABEL = 255
@@ -196,7 +204,7 @@ def build_segments(
     in_scope: set[str] | None = None,
 ) -> dict:
     """同一便の「下流にある全停」ペアの所要秒を集め、中央値で集約して
-    {(route_gid, 乗車gid, 降車gid): ride_min} を返す。
+    {(route_gid, 乗車gid, 降車gid): (ride_min, trip_count)} を返す。
 
     【2026-07-26 変更・DB設計書 9章#16 対応】
     旧実装は隣接停ペア（`zip(rows, rows[1:])`）のみを区間化していた。reach は区間を
@@ -211,6 +219,8 @@ def build_segments(
       これを渡さないと全国の停で O(n^2) になり破綻するので、本番経路では必ず渡す。
     - 昼フィルタは乗車停の出発時刻（無ければ到着）で判定。
     - ride_min = 降車停の到着 − 乗車停の出発（秒）→ 中央値 → 分へ丸め。
+    - trip_count = 中央値の母数＝その区間を土日昼に走る便数（acc[key] の長さ）。
+      「本数少なめ」バッジ（FEW_TRIPS_THRESHOLD）の判定に使う。
     - 環状路線で同一停が再登場する便では、同一停どうしのペアは作らない。
     """
     acc: dict[tuple[str, str, str], list[int]] = defaultdict(list)
@@ -261,13 +271,13 @@ def build_segments(
                 acc[(route_gid, gid_a, gid_b)].append(ride)
                 tally["pair_kept"] += 1
 
-    segments: dict[tuple[str, str, str], int] = {}
+    segments: dict[tuple[str, str, str], tuple[int, int]] = {}
     for key, rides in acc.items():
         ride_min = int(round(statistics.median(rides) / 60))
         if ride_min <= 0:  # 中央値が分に丸めて0分（超短区間）はスキップ
             tally["skip_zero_min"] += 1
             continue
-        segments[key] = ride_min
+        segments[key] = (ride_min, len(rides))  # len(rides) = 土日昼の便数
     tally["segments"] = len(segments)
     return segments
 
@@ -327,6 +337,21 @@ def _print_summary(parsed: dict, failed: dict | None, db_stats: dict | None) -> 
             f"{t['skip_not_lunch']:>7}{t['skip_nonpos']:>7}"
         )
     print(f"{'合計区間':<10}{total_seg:>21}")
+
+    # 便数分布。しきい値（FEW_TRIPS_THRESHOLD）が妥当かを毎回目視できるようにする。
+    # ※ここは「全区間」の分布。店へ到達できる区間に絞ると1本の割合はもっと高い（引き継ぎ資料4章）。
+    counts = [tc for _r, segs, _t in parsed.values() for _rm, tc in segs.values()]
+    if counts:
+        few = sum(1 for c in counts if c < FEW_TRIPS_THRESHOLD)
+        print(
+            f"便数分布（土日{LUNCH_LABEL.split(' ')[0]}）: "
+            f"1本 {sum(1 for c in counts if c == 1)} / "
+            f"2-3本 {sum(1 for c in counts if 2 <= c <= 3)} / "
+            f"4本以上 {sum(1 for c in counts if c >= 4)} / "
+            f"中央値 {int(statistics.median(counts))}"
+        )
+        print(f"  うち「本数少なめ」(<{FEW_TRIPS_THRESHOLD}本): {few} 区間（{few / len(counts) * 100:.1f}%）")
+
     if failed:
         print(f"取得失敗: {len(failed)} 社 -> " + ", ".join(f"{op}({msg})" for op, msg in failed.items()))
     else:
@@ -364,6 +389,7 @@ def _segments_table(md):
         Column("boarding_stop_id", BigInteger, primary_key=True),
         Column("alight_stop_id", BigInteger, primary_key=True),
         Column("ride_min", Integer),
+        Column("trip_count", Integer),
     )
 
 
@@ -382,7 +408,7 @@ def _upsert_segments(conn, seg_tbl, rows: list[dict]) -> None:
     stmt = insert(seg_tbl).values(rows)
     stmt = stmt.on_conflict_do_update(
         index_elements=[seg_tbl.c.route_id, seg_tbl.c.boarding_stop_id, seg_tbl.c.alight_stop_id],
-        set_={"ride_min": stmt.excluded.ride_min},
+        set_={"ride_min": stmt.excluded.ride_min, "trip_count": stmt.excluded.trip_count},
     )
     conn.execute(stmt)
 
@@ -456,7 +482,7 @@ def _apply_to_db(parsed: dict) -> dict:
         # 3) route_segments UPSERT ＋ stale削除
         for operator, (_routes_map, segments, _t) in parsed.items():
             seg_rows = []
-            for (route_gid, board_gid, alight_gid), ride_min in segments.items():
+            for (route_gid, board_gid, alight_gid), (ride_min, trip_count) in segments.items():
                 rpk = route_id_map.get(route_gid)
                 bpk = stop_id_map.get(board_gid)
                 apk = stop_id_map.get(alight_gid)
@@ -467,6 +493,7 @@ def _apply_to_db(parsed: dict) -> dict:
                 seg_rows.append({
                     "route_id": rpk, "boarding_stop_id": bpk,
                     "alight_stop_id": apk, "ride_min": ride_min,
+                    "trip_count": trip_count,
                 })
             # 全量再生成：この社の区間を削除してから INSERT する（削除→投入の順序が必須）
             op_route_pks = [pk for gid, pk in route_id_map.items() if gid.startswith(f"{operator}:")]

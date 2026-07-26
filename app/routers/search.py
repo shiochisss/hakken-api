@@ -31,6 +31,8 @@ from sqlalchemy import text
 
 from app.db import get_engine
 from app.deps import get_current_uid
+# 「本数少なめ」のしきい値は生成側（バッチ）に定義がある。二重定義を避けて import する。
+from batch.route_segments import FEW_TRIPS_THRESHOLD
 
 router = APIRouter()
 
@@ -131,6 +133,7 @@ def search(
                     """
                     SELECT r.store_id, r.boarding_stop_id, r.ride_min, r.walk2_min,
                            r.transfer, r.via_hub_id, r.alight_stop_id, r.route_label,
+                           r.min_trip_count,
                            s.name AS store_name, s.category_l, s.category_s, s.status,
                            s.address, s.area_label, s.lat AS store_lat, s.lng AS store_lng,
                            s.gmaps_url,
@@ -196,6 +199,9 @@ def search(
                 "total": b["total"], "transfer": r["transfer"],
                 "via_hub": r["hub_name"] if r["transfer"] == "hub1" else None,
             },
+            # 「本数少なめ」＝土日昼の便数がしきい値未満。除外はせずバッジで開示する（引き継ぎ資料4章）。
+            # min_trip_count が NULL（バッチ未実行）のときは false＝バッジを出さない側に倒す。
+            "few_trips": r["min_trip_count"] is not None and r["min_trip_count"] < FEW_TRIPS_THRESHOLD,
             "boarding_stop": r["boarding_name"],
             "alight_stop": r["alight_name"],
             "route_label": r["route_label"],
