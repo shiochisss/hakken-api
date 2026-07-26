@@ -78,11 +78,17 @@ gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app --forwarded-allow-ips="*
 | PUT | `/api/conditions` | 楽条件をUPSERT保存し保存後の値を返す（F3・B-5） |
 | POST | `/api/favorites` | お気に入り追加（重複は冪等・204）（F6・B-8） |
 | DELETE | `/api/favorites/{store_id}` | お気に入り解除（未登録も冪等・204）（F6・B-9） |
+| GET | `/api/search` | 逆引き検索。楽な順に店を返す（F4・B-6） |
+| GET | `/api/stores/{store_id}` | 店詳細（現在地からの楽さ内訳込み）（F4・B-7） |
 | POST | `/api/going` | 「ここ行く」登録＋`koko_iku`計測→`{going_id}`（F7・B-10） |
+| GET | `/api/mylist` | マイリスト（行く予定／お気に入り）（F7・B-11） |
+| POST | `/api/going/{going_id}/arrived` | 着いたよ。150m以内→`verified`／遠い→`pending`（F8・B-12） |
+| GET | `/api/arrival-banner` | 着いたバナー照合。該当なしは`null`（F8b・B-13） |
 | POST | `/api/events` | 計測イベントを`event_log`へ追記→204（B-14） |
 | POST | `/api/submissions` | たれ込み投稿を`pending`で受付→`{submission_id}`（F11・B-15） |
+| POST | `/api/submissions/photo-upload` | たれ込み写真を非公開Blobへ→`{photo_id}`（F11・B-16） |
 
-※今後、API設計書（`hakken-docs/api/`）に沿ってエンドポイントを追加していく。未実装：検索`/api/search`・店詳細`/api/stores/{id}`（B-6/B-7＝reach事前計算と探索半径が未決）、マイリスト`/api/mylist`（B-11）、着いた系（B-12/B-13）、写真アップロード（B-16＝Blob構築待ち）。
+※**API設計書（B-1〜B-16）の全エンドポイントを実装済み**（2026-07-26 に B-12/B-13 を追加して完了）。B-17 は運営の手動DB操作でありオンラインAPIは無い。
 
 ## 認証（F1：Googleログイン）
 
@@ -108,7 +114,9 @@ python -m batch.f9_stops             # 本反映
   `stops.txt` をエリア矩形＋`location_type=0` でフィルタ → `gtfs_stop_id`（`社:原ID`）をキーに
   UPSERT → is_hub をホワイトリストで付与。**新規依存なし**（標準ライブラリ＋既存 SQLAlchemy）。
 - **エリア矩形**：2026-07-26 に**東京23区相当**へ拡大（`config/area_bbox.json`）。
-  stops 1,491→6,880／route_segments 23,937→108,069／検索応答は約2.2倍（41→102ms・ローカル計測）。
+  stops 1,491→**6,087**／route_segments 23,937→108,069。
+  拡大直後は検索応答が約2倍に悪化したが（stops を毎リクエスト全件ロードしていたため）、
+  SQL側の矩形絞り込みで解消済み（**median 2.6-2.9ms**・ローカル計測。DB設計書9章#17）。
 - **対象から外した社**：小田急（`calendar.txt` 欠落で区間が常に0件）・西東京（23区内に停0件）。
   経緯と復活条件は `config/gtfs_sources.json` の `"_removed_2026-07-26"` に記録。
 - **国際興業バスは取得不可**：ODPT・gtfs-data.jp のいずれにも GTFS が存在しない（2026-07-26 確認）。
@@ -135,7 +143,8 @@ python -m batch.f9_stops             # 本反映
   含めない**（待ち時間を捨象しているモデルで「1分早いだけの乗換」が直行に勝つのを防ぐため）。
 - テスト：`python -m tests.test_f9_stops`（stops パース層）／
   `python -m tests.test_route_segments`（区間・便数・reach の純関数）／
-  `python -m tests.test_search_bbox`（検索の stops 一次絞り込み）。いずれも DB/ネットワーク不要。
+  `python -m tests.test_search_bbox`（検索の stops 一次絞り込み）／
+  `python -m tests.test_arrival`（F8 の距離判定・バナー選択）。いずれも DB/ネットワーク不要。
 
 ## 業務API（F3楽条件／F6お気に入り／F7ここ行く／計測／F11たれ込み）
 

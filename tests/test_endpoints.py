@@ -139,6 +139,8 @@ def test_requires_auth():
         ("post", "/api/favorites", {"store_id": 1}),
         ("delete", "/api/favorites/1", None),
         ("post", "/api/going", {"store_id": 1}),
+        ("post", "/api/going/1/arrived", {"lat": 35.7, "lng": 139.65}),
+        ("get", "/api/arrival-banner?lat=35.7&lng=139.65", None),
         ("post", "/api/events", {"event_type": "app_open"}),
         ("post", "/api/submissions", {"type": "closure_report", "store_id": 1, "payload": {"reason": "x"}}),
         # B-16 写真アップロード。Depends(get_current_uid) はボディ検証より先に解決されるため、
