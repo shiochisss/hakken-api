@@ -78,7 +78,7 @@ gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app --forwarded-allow-ips="*
 | PUT | `/api/conditions` | 楽条件をUPSERT保存し保存後の値を返す（F3・B-5） |
 | POST | `/api/favorites` | お気に入り追加（重複は冪等・204）（F6・B-8） |
 | DELETE | `/api/favorites/{store_id}` | お気に入り解除（未登録も冪等・204）（F6・B-9） |
-| GET | `/api/search` | 逆引き検索。楽な順に店を返す（F4・B-6） |
+| GET | `/api/search` | 逆引き検索。楽な順に店を返す＋`meta.origin`（起点の住所）（F4・B-6） |
 | GET | `/api/stores/{store_id}` | 店詳細（現在地からの楽さ内訳込み）（F4・B-7） |
 | POST | `/api/going` | 「ここ行く」登録＋`koko_iku`計測→`{going_id}`（F7・B-10） |
 | GET | `/api/mylist` | マイリスト（行く予定／お気に入り）（F7・B-11） |
@@ -96,7 +96,7 @@ gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app --forwarded-allow-ips="*
   セッショントークンは **HttpOnly Cookie**（生値）＋ **DBにはSHA-256ハッシュ**を保存。
 - 保護：`/api/*` は要ログイン（`app/deps.py` の `get_current_uid`）。未認証・期限切れ・退会（`is_deleted`）は401。
 - CSRF：`state` Cookie 照合。オープンリダイレクト防止：`next` は `FRONTEND_ORIGIN` 同一originのみ許可。
-- **DBマイグレーション**：`schema_postgres.sql`（docs）適用後に `db/001_sessions.sql` を流す（`users(id)`参照のため順序必須）。
+- **DBマイグレーション**：`schema_postgres.sql`（docs）適用後に `db/001_sessions.sql` を流す（`users(id)`参照のため順序必須）。稼働中のDBに列を足すときは `db/002_origin_columns.sql`（001 は `DROP TABLE` するので流さない）。
 - **Azure（本番）注意**：TLSはプロキシ終端のため、Secure Cookie/scheme判定に `--proxy-headers`（uvicorn）等を有効化する（実際の設定は「起動方法 → 本番起動（Azure App Service）」節参照）。
 - テスト：`python -m tests.test_auth`（DB/Google非依存の到達パス＋純関数）。
 
@@ -145,6 +145,46 @@ python -m batch.f9_stops             # 本反映
   `python -m tests.test_route_segments`（区間・便数・reach の純関数）／
   `python -m tests.test_search_bbox`（検索の stops 一次絞り込み）／
   `python -m tests.test_arrival`（F8 の距離判定・バナー選択）。いずれも DB/ネットワーク不要。
+
+## 起点（現在地）の住所表示と記録
+
+実機テストで「**現在地がどこからなのか分からない**ため、提示される楽なルートの信ぴょう性が薄い」と
+指摘されたことへの対応（2026-07-27）。S2 のヘッダに起点の住所を出し、あわせて
+「その提案はどこ起点だったか」を後から辿れるように記録する。
+
+- **住所は外部APIを呼ばない**。同梱した町丁目代表点（`config/oaza_points.json`・6,735点・412KB）の
+  最寄り探索で解決する（`app/services/origin.py`）。追加ライブラリなし・障害点なし・所要 0.15ms。
+  - 検討して見送った案: 国土地理院の逆ジオコーディングAPI（公式SLAが無く毎検索ぶら下がる）／
+    `jageocoder`（辞書DBが最小 351MB(zip)で **App Service Free F1 のディスク1GB** と GitHub の
+    100MB上限に載らない）／`reverse_geocoder`（市区町村・ローマ字で要件未達）。
+  - 限界: 町丁目の**代表点**への最寄り判定なので境界付近では隣の町丁目名が出うる。国土地理院APIとの
+    突き合わせ（12地点）で市区町村 12/12・町丁目 9/12 一致（DB設計書9章#18）。
+- **位置の生値は保存しない**（DB設計書1章-5）。`round_origin` で**小数3桁（約110m格子）**に丸め、
+  DB側も `NUMERIC(6,3)` で粒度を保証する（二重の防御）。
+- 書き込み先: `GET /api/search`・`GET /api/stores/{id}` が `sessions.origin_*` を更新 →
+  `POST /api/going` が `going_list` へ転記して宣言時点の起点を固定する。
+  **`preview=1` では解決も記録もしない**（スライダー連打で無駄な処理をしないため）。
+  `going_list.session_id` は **FK にしない**（sessions はログアウトで物理削除されるため）。
+- **DDL**: `db/002_origin_columns.sql`（列追加のみ・`IF NOT EXISTS`・後方互換）。
+  稼働中のDBにはこれを流す。**`001_sessions.sql` は冒頭で `DROP TABLE` するので本番に流さないこと**。
+- **データの再生成**（年次更新の想定・手動）:
+  ```bash
+  python -m batch.build_oaza_points --dry-run   # 取得〜集計のみ
+  python -m batch.build_oaza_points             # config/oaza_points.json を生成
+  ```
+  出典: **大字・町丁目位置参照情報 国土交通省**（`ISJ_VERSION = 19.0b`）をエリア矩形で抽出・加工。
+  利用約款により商用利用可だが**出典明示が必須**（アプリ側は S5「位置情報について」に表示）。
+  取得した zip は `data/isj/`（Git管理外）。
+- 暫定値（すべて `app/services/origin.py` に定数化）:
+
+| 値 | 定数 |
+|---|---|
+| 丸め桁数 3（≒110m格子） | `ORIGIN_PRECISION` |
+| 格子1辺 0.01度（≒1.1km） | `GRID_DEG` |
+| 探索の打ち切り 3x3 → 7x7（±3.3km） | `GRID_RINGS` |
+
+- テスト: `python -m tests.test_origin`（丸めが必ず3桁／実地点の住所／**データが無くても例外を出さない**／
+  ラベルが `VARCHAR(120)` に収まる）。DB・ネットワーク不要。
 
 ## 業務API（F3楽条件／F6お気に入り／F7ここ行く／計測／F11たれ込み）
 
