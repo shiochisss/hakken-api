@@ -27,7 +27,9 @@
 TBD（DB設計書9章・確定した暫定値）:
   - 探索半径R / 第2ソートキー（#10）: R=walk_max×80÷1.3m、同total時 walk1昇順→store_id。
   - relax_suggestions 算出: 0件時に walk_max+5分での件数を1件返す（初期版）。
-  - category（#12）: 今回は全カテゴリのみ（category は受け取るが未使用）。
+  - category（#12）: 2026-07-28 に実装（それまで受け取るだけで未使用＝どのチップを押しても
+    全件が返っていた）。対応表は _CATEGORY_SQL の4キー。掲載146店では `bakery`・`sento` が
+    該当0件だが、**キーは残して「押すと正しく0件」になるようにした**（DB設計書9章#12）。
   - SAS URL 発行（#14）: 未実装。store_photos は参照するが own/user の ref は当面 None。
 """
 from __future__ import annotations
@@ -52,6 +54,30 @@ WALK_DETOUR = 1.3           # 直線→道のり係数（store_stops と同一�
 WALK_SPEED_M_PER_MIN = 80   # 徒歩速度 m/分
 _TRANSFERS = {"none", "hub1"}
 RELAX_WALK_DELTA = 5        # 0件時の緩和提案（walk_max +5分）
+
+# カテゴリチップのキー → stores の分類条件（DB設計書9章#12・2026-07-28 確定）。
+# 値は**固定の SQL 断片**で、キーはホワイトリスト検証を通ったものしか使わない（注入経路なし）。
+#
+# 2026-07-28 まで search は category を受け取るだけで WHERE に使っておらず、
+# **どのチップを押しても全件が返っていた**（本番で発見）。
+#
+# 掲載146店の実測では `bakery`（category_s='パン'）と `sento`（category_l='銭湯'）は
+# **該当0件**。それでも**キーは4つとも残す**（2026-07-28 判断）。押した結果が正しく0件に
+# なるほうが、チップを消すより実態を伝えられるため（掲載が増えれば自動で出る／
+# フロントとサーバの2箇所を同時に直す運用も要らない）。
+#
+# ※ food で coalesce しているのは、category_s が NULL の店（実測5店）を落とさないため。
+#   設計書の SQL は `s.category_s <> 'パン'` だが、NULL <> 'パン' は NULL 判定になり
+#   その店が「ごはん」から消える。
+# ※ category_s は**自由記述74種類**（「イタリア料理」「コーヒースタンド」等・多くが1店）。
+#   bakery を実際に機能させるには category_l に分類を新設し、キュレーション側の語彙を
+#   正規化する必要がある（DB設計書9章#12の新TBD）。
+_CATEGORY_SQL = {
+    "cafe": "s.category_l = 'カフェ'",
+    "food": "s.category_l = '飲食' AND coalesce(s.category_s, '') <> 'パン'",
+    "bakery": "s.category_s = 'パン'",
+    "sento": "s.category_l = '銭湯'",
+}
 
 # 現在地の妥当域（日本全体をカバー）。範囲外は 400（B-6 は 400 を規定＝Query(ge/le)の422でなく手動400に統一）。
 LAT_MIN, LAT_MAX = 20.0, 46.0
@@ -151,13 +177,17 @@ def search(
     ride_max: int = Query(...),
     total_max: int = Query(...),
     transfer: str = Query("none"),
-    category: str | None = Query(None),   # 今回は全カテゴリのみ（未使用・#12確定後に対応）
+    category: str | None = Query(None),   # チップのキー（_CATEGORY_SQL のみ許可）。null=すべて
     preview: str | None = Query(None),
     session: CurrentSession = Depends(get_current_session),
 ):
     # バリデーション（違反は 400）。上限は設けない（大きな値でもクエリは破綻しない）。
     if transfer not in _TRANSFERS:
         raise HTTPException(status_code=400, detail="invalid transfer")
+    # category はホワイトリスト（B-6）。未知のキーを黙って「すべて」に落とすと、
+    # 絞れていないのに絞れたように見えて気付けないため 400 にする。
+    if category is not None and category not in _CATEGORY_SQL:
+        raise HTTPException(status_code=400, detail="invalid category")
     for _name, _v in (("walk_max", walk_max), ("ride_max", ride_max), ("total_max", total_max)):
         if _v < 1:
             raise HTTPException(status_code=400, detail=f"{_name} must be >= 1")
@@ -192,9 +222,12 @@ def search(
             nearby = _nearby_walk1(stops, lat, lng, w_max)
             if not nearby:
                 return {}
+            # カテゴリ条件は固定の SQL 断片（_CATEGORY_SQL・キーは検証済み）。
+            # WHERE に入れることで preview の件数・0件時の緩和提案にも同じ絞りが効く。
+            cat_sql = f"AND ({_CATEGORY_SQL[category]})" if category else ""
             rows = conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT r.store_id, r.boarding_stop_id, r.ride_min, r.walk2_min,
                            r.transfer, r.via_hub_id, r.alight_stop_id, r.route_label,
                            r.min_trip_count,
@@ -209,6 +242,7 @@ def search(
                     LEFT JOIN stops hub ON hub.id = r.via_hub_id
                     WHERE r.boarding_stop_id = ANY(:ids)
                       AND s.status = '営業中' AND s.is_listed = true
+                      {cat_sql}
                     """
                 ),
                 {"ids": list(nearby.keys())},
@@ -229,11 +263,15 @@ def search(
         origin = origin_service.resolve_origin(lat, lng, nearest_stop)
         origin_service.save_session_origin(conn, session.sid, lat, lng, origin["label"])
 
-        # 0件時のみ relax 提案（walk_max +5分での件数）
+        # 0件時のみ relax 提案（walk_max +5分での件数）。
+        # **緩めても0件なら提案しない**（2026-07-28）。カテゴリで絞った結果の0件は歩きを
+        # 緩めても増えないため、「歩きを+5分ゆるめる（0件）」という押しても何も起きない
+        # ボタンが出てしまう。0件を行き止まりにしない趣旨は「次の一手がある時に出す」で足りる。
         relax: list[dict] = []
         if count == 0:
             relaxed = run(walk_max + RELAX_WALK_DELTA)
-            relax = [{"param": "walk_max", "delta": RELAX_WALK_DELTA, "count": len(relaxed)}]
+            if relaxed:
+                relax = [{"param": "walk_max", "delta": RELAX_WALK_DELTA, "count": len(relaxed)}]
 
         # photo 解決（対象店の approved/is_primary を1回引く）
         photo_by_store: dict[int, dict] = {}
