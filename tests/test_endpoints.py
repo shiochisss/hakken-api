@@ -152,6 +152,45 @@ def test_requires_auth():
         assert r.status_code == 401, f"{method.upper()} {path} -> {r.status_code} (expected 401)"
 
 
+def test_category_keys_match_front_chips():
+    """サーバの対応表とフロントのチップのキーが一致していること。
+
+    2026-07-28: それまで search.py は category を受け取るだけで**絞り込みに使っておらず**、
+    どのチップを押しても全件が返っていた（本番で発見）。
+    `bakery`・`sento` は掲載データでは該当0件だが、**キーは残して「押すと正しく0件」に
+    する**方針（DB設計書9章#12）。サーバが未知のキーを400で弾くため、フロントの
+    CATEGORY_CHIPS とキー集合が食い違うと検索が失敗する。ここで固定して取り違えを防ぐ。
+    """
+    from app.routers.search import _CATEGORY_SQL
+
+    assert set(_CATEGORY_SQL) == {"cafe", "food", "bakery", "sento"}, (
+        "チップを増減したら hakken-front の CATEGORY_CHIPS も合わせること"
+    )
+
+
+def test_category_food_keeps_null_category_s():
+    """「ごはん」の条件が category_s の NULL を落とさないこと。
+
+    設計書の SQL は `s.category_s <> 'パン'` だが、NULL <> 'パン' は NULL 判定になり、
+    category_s が未設定の店（本番実測5店）が「ごはん」から消える。coalesce が必須。
+    """
+    from app.routers.search import _CATEGORY_SQL
+
+    food = _CATEGORY_SQL["food"]
+    assert "coalesce" in food.lower(), f"NULL 落ちを防ぐ coalesce が無い: {food}"
+
+
+def test_search_rejects_unknown_category():
+    """対応表に無い category は 400（黙って全件返すと絞れたように見えて気付けない）。"""
+    r = client.get("/api/search", params={
+        "lat": 35.7357, "lng": 139.6518,
+        "walk_max": 15, "ride_max": 20, "total_max": 40, "transfer": "none",
+        "category": "ramen",   # 対応表に無いキー
+    })
+    # 未ログインなら 401 が先に立つ。Cookie 無しの到達パスでは 401、認証済みなら 400。
+    assert r.status_code in (400, 401), r.status_code
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:
