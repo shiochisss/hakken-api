@@ -217,6 +217,33 @@ def test_transfer_penalty_keeps_transfer_only_routes():
     assert row["transfer"] == "hub1" and row["ride_min"] == 20  # 実値。ペナルティは含まない
 
 
+def test_load_routes_prefers_short_name():
+    """label は系統番号（short_name）を優先し、無いときだけ起終点（long_name）に落とす。
+
+    2026-07-27 に long→short から short→long へ変更した。**関東バスだけが両方を持つ**ため、
+    long 優先だと関東の路線だけ「荻窪駅〜練馬駅」形式になり、他社の系統番号表記と
+    画面上で混在していた（`load_routes` の docstring 参照）。
+    """
+    got = rs.load_routes([
+        # 関東バス: 両方持つ → 系統番号を採る（ここが今回の変更点）
+        {"route_id": "10058", "route_short_name": "荻０７", "route_long_name": "荻窪駅〜練馬駅"},
+        # 都営・京王・西武: short のみ → 変わらない
+        {"route_id": "003", "route_short_name": "市０１", "route_long_name": ""},
+        # 京成: long のみ（long 側が系統番号）→ フォールバックで拾う
+        {"route_id": "3551310579", "route_short_name": "", "route_long_name": "塩浜０１"},
+        # 関東バスの出入庫便など short が無いもの → 起終点表記のまま残る
+        {"route_id": "20025", "route_short_name": "", "route_long_name": "丸山営業所〜練馬駅"},
+        # route_id が無い行は捨てる
+        {"route_id": "", "route_short_name": "x", "route_long_name": "y"},
+    ])
+    assert got == {
+        "10058": "荻０７",
+        "003": "市０１",
+        "3551310579": "塩浜０１",
+        "20025": "丸山営業所〜練馬駅",
+    }
+
+
 def main():
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     for t in tests:
