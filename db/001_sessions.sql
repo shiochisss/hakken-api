@@ -18,7 +18,15 @@ CREATE TABLE sessions (
     user_id      BIGINT   NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at   TIMESTAMPTZ NOT NULL,                            -- 絶対有効期限（既定 now()+SESSION_TTL_DAYS）
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()               -- 監査・将来のスライディング延長用
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),              -- 監査・将来のスライディング延長用
+    -- 直近の検索起点（2026-07-27 追加）。S2 の「〈住所〉から探しています」と、
+    -- 「その提案はどこ起点だったか」の事後検証に使う。
+    -- 位置の生値は保存しない（DB設計書1章-5）＝ NUMERIC(6,3) で小数3桁（約110m格子）に
+    -- 丸めた値のみ。型そのものが粒度を保証する（実装ミスでも細かい値が入らない）。
+    origin_lat        NUMERIC(6,3),
+    origin_lng        NUMERIC(6,3),
+    origin_label      VARCHAR(120),                               -- 町丁目までの住所ラベル
+    origin_updated_at TIMESTAMPTZ
 );
 
 CREATE INDEX idx_sessions_user    ON sessions (user_id);
