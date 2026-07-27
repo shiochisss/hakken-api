@@ -165,13 +165,37 @@ def load_trips(trip_rows) -> dict[str, tuple[str, str]]:
 
 
 def load_routes(route_rows) -> dict[str, str]:
-    """routes.txt → {route_id: label}。label は long_name 優先、無ければ short_name。"""
+    """routes.txt → {route_id: label}。label は **short_name 優先**、無ければ long_name。
+
+    優先順を 2026-07-27 に long→short から **short→long** へ変更した。
+
+    理由: `route_short_name` が系統番号（`荻０７`・`中３０`）、`route_long_name` が起終点
+    （`荻窪駅〜練馬駅`）という使い分けになっており、S3 の「〜に乗車」で見せたいのは系統番号
+    だから。**関東バスだけが両方を持つ**ため、long 優先だと関東の路線だけ起終点表記になり、
+    他社の系統番号表記と画面上で混在していた（実測: routes の関東111路線中105件が起終点表記／
+    reach の 1,580行＝全体の39%が関東）。
+
+    各社の埋まり方（2026-07-26 取得データの実測）:
+
+    | 社 | 路線数 | short のみ | long のみ | 両方 |
+    |---|---|---|---|---|
+    | kanto  | 245 |   0 | 128 | **117** |
+    | seibu  | 386 | 370 |  16 | 0 |
+    | toei   | 151 | 151 |   0 | 0 |
+    | keio   | 255 | 255 |   0 | 0 |
+    | keisei |  16 |   0 |  16 | 0 |
+
+    関東以外は short と long が排他的なので、**この変更で他社の label は1件も変わらない**
+    （keisei は long 側に系統番号が入っているが、short が空なのでフォールバックで拾われる）。
+    関東は 111路線中71件が系統番号になり、short を持たない40件（出入庫便・営業所発着が多い）は
+    従来どおり起終点表記のまま残る。
+    """
     out: dict[str, str] = {}
     for r in route_rows:
         rid = (r.get("route_id") or "").strip()
         if not rid:
             continue
-        label = (r.get("route_long_name") or r.get("route_short_name") or "").strip()
+        label = (r.get("route_short_name") or r.get("route_long_name") or "").strip()
         out[rid] = label
     return out
 
