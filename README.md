@@ -98,6 +98,15 @@ gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app --forwarded-allow-ips="*
 - CSRF：`state` Cookie 照合。オープンリダイレクト防止：`next` は `FRONTEND_ORIGIN` 同一originのみ許可。
 - **DBマイグレーション**：`schema_postgres.sql`（docs）適用後に `db/001_sessions.sql` を流す（`users(id)`参照のため順序必須）。稼働中のDBに列を足すときは `db/002_origin_columns.sql`（001 は `DROP TABLE` するので流さない）。
 - **Azure（本番）注意**：TLSはプロキシ終端のため、Secure Cookie/scheme判定に `--proxy-headers`（uvicorn）等を有効化する（実際の設定は「起動方法 → 本番起動（Azure App Service）」節参照）。
+- **⚠ cross-site Cookie の制約（既知の制限）**：本番はフロント（`*.azurestaticapps.net`）と
+  API（`*.azurewebsites.net`）が**別サイト**なので、セッションCookieはサードパーティCookie扱いになる。
+  サーバは `SameSite=None; Secure` ＋ `Access-Control-Allow-Credentials: true` ＋ origin明示を
+  正しく返している（2026-07-28 に本番で実測確認）が、**Safari は third-party cookie を全面ブロック
+  するため `SameSite=None` は効かない**（`SameSite` は「送ってよい」という許可の表明にすぎない）。
+  そのため **Safari（iOS/macOS）・Firefox・Brave では全ての `/api/*` が401**になり、Chrome でも
+  「サードパーティCookieをブロック」設定なら同じ。**実装では回避できない**。
+  → **動作確認は Chrome／Edge に限定される。** 根本対応は独自ドメインでフロント・APIを同一サイトに
+  揃えること（時期未定）。詳細と対応案は画面設計書 A-9。
 - テスト：`python -m tests.test_auth`（DB/Google非依存の到達パス＋純関数）。
 
 ## 夜間バッチ（F9：バス停DB生成）
