@@ -152,6 +152,83 @@ def test_requires_auth():
         assert r.status_code == 401, f"{method.upper()} {path} -> {r.status_code} (expected 401)"
 
 
+def _dist_for(minutes: float) -> float:
+    """`_walk_min` がちょうど `minutes` 分と丸める距離（m）を作る。"""
+    from app.routers.search import WALK_DETOUR, WALK_SPEED_M_PER_MIN
+
+    return minutes * WALK_SPEED_M_PER_MIN / WALK_DETOUR
+
+
+def test_walk_only_margin_boundary():
+    """マージンの境界。`direct + 1 <= total` のときだけ徒歩にする。
+
+    2026-07-28 追加。それまで検索は reach（バス経路）しか見ておらず、駅前の店にも
+    バスを勧めていた（江古田駅→焼肉レストラン三宝苑＝直線徒歩0分に「歩2＋バス2＋歩5＝9分」）。
+    """
+    from app.routers.search import WALK_BEATS_BUS_MARGIN, walk_only_info
+
+    assert WALK_BEATS_BUS_MARGIN == 1, "マージンを変えたら設計書9章の暫定値も直すこと"
+
+    d5 = _dist_for(5)
+    # 徒歩5分 vs バス6分 → 5+1<=6 で徒歩
+    got = walk_only_info(d5, total=6, walk_max=20)
+    assert got is not None and got["minutes"] == 5
+    assert got["distance_m"] == int(round(d5))
+    # 徒歩5分 vs バス5分（同点）→ 推定を実測に勝たせない
+    assert walk_only_info(d5, total=5, walk_max=20) is None
+    # 徒歩5分 vs バス4分（バスが速い）→ 当然バス
+    assert walk_only_info(d5, total=4, walk_max=20) is None
+
+
+def test_walk_only_respects_walk_max():
+    """歩き上限を超える徒歩には置き換えない（「歩かない」設定を破らない）。"""
+    from app.routers.search import walk_only_info
+
+    d12 = _dist_for(12)
+    # 上限20分なら採用
+    assert walk_only_info(d12, total=30, walk_max=20) is not None
+    # 上限10分（no_walk）なら不採用＝バス経路のまま残る
+    assert walk_only_info(d12, total=30, walk_max=10) is None
+
+
+def test_walk_only_zero_minutes_is_valid():
+    """店が目の前（徒歩0分）でも採用されること。
+
+    実測で最も不合理だったのがこのケース（江古田駅→三宝苑は直線20m＝徒歩0分なのに
+    バス9分を提示していた）。0 は falsy なので判定から漏れやすい＝明示的に固定する。
+    """
+    from app.routers.search import walk_only_info
+
+    got = walk_only_info(_dist_for(0.2), total=9, walk_max=10)
+    assert got is not None and got["minutes"] == 0
+
+
+def test_stores_walk_only_fallback_bound():
+    """walk_only の歩き上限は user_conditions.walk_max。未設定時のみこの値。"""
+    from app.routers.stores import WALK_ONLY_MAX_MIN
+
+    assert WALK_ONLY_MAX_MIN == 20, "変えたら API設計書 B-7 の記述も直すこと"
+
+
+def test_stores_applies_user_conditions():
+    """B-7 が楽条件を読むこと（S2 と S3 の所要時間が食い違わないための担保）。
+
+    2026-07-28 まで B-7 は walk_max/ride_max/total_max/transfer を一切見ずに最小 total を
+    選んでいた。そのため同じ店が **S2 で29分（直行）／S3 で18分（乗換1回）** と食い違った
+    （18分は「乗換なし」設定の S2 が除外していた経路）。条件はクエリではなく
+    user_conditions から読む（API契約・フロントを変えずに済むため）。
+    """
+    import inspect
+
+    from app.routers import stores as m
+
+    src = inspect.getsource(m.get_store)
+    assert "FROM user_conditions" in src, "B-7 が楽条件を読んでいない＝S2 と食い違う"
+    for key in ("transfer", "walk_max", "ride_max", "total_max"):
+        assert key in src, f"{key} を条件判定に使っていない"
+    assert "out_of_conditions" in src, "条件を満たす経路が無いときの開示が無い"
+
+
 def test_category_keys_match_front_chips():
     """サーバの対応表とフロントのチップのキーが一致していること。
 
