@@ -17,7 +17,9 @@
      ※hotpepper_url は「店ページ」のURLで画像ではないため photo.ref には使わない
        （<img src> に入れると必ず読み込み失敗する）。ホットペッパーの画像URL取得は
        API連携が必要＝別件・未実装。
-  6) ORDER BY total → walk1 → store_id。
+  6) ORDER BY 実効所要 → walk1 → store_id。**実効所要は「徒歩の方が速い店」では徒歩分**
+     （2026-07-28。walk_only_info 参照）。それまでは駅前の店にもバス経路を出しており、
+     江古田駅→焼肉レストラン三宝苑（直線徒歩0分）に「歩2＋バス2＋歩5＝9分」を提示していた。
   7) 起点（現在地）を住所ラベルに解決して `meta.origin` に載せ、`sessions` にも記録する
      （2026-07-27 追加。S2 の「〈住所〉から探しています」＝実機で「現在地がどこからなのか
      分からず信ぴょう性が薄い」と指摘されたため）。外部APIは呼ばない＝同梱した町丁目
@@ -54,6 +56,21 @@ WALK_DETOUR = 1.3           # 直線→道のり係数（store_stops と同一�
 WALK_SPEED_M_PER_MIN = 80   # 徒歩速度 m/分
 _TRANSFERS = {"none", "hub1"}
 RELAX_WALK_DELTA = 5        # 0件時の緩和提案（walk_max +5分）
+
+# 「歩いた方が速い」と判定するマージン（分）。**暫定・2026-07-28 ibes 判断**。
+#
+# 背景: 駅前の店にバスを勧めていた。江古田駅→焼肉レストラン三宝苑（直線徒歩0分）に
+#   「歩2＋バス2＋歩5＝9分」を提示していた。原因は検索が reach（バス経路）しか見ず、
+#   **徒歩だけで行ける選択肢が存在しなかった**こと。
+#
+# なぜマージンを積むか: direct_walk は「直線距離×1.3÷80m/分」の**推定値**で、川・線路・
+#   高低差を無視する（DB設計書の既知の副作用）。一方 total はバスの実測
+#   （route_segments の所要）に基づく。**推定が実測に同点で勝つのを防ぐ**ため 1分の下駄。
+#
+# 本番146店・6起点×3プリセット（延べ568件）での実測:
+#   マージン 0分 → 54件 9.5% ／ **1分 → 49件 8.6%** ／ 2分 → 37件 6.5% ／ 3分 → 31件 5.5%
+#   該当の大半は「僅差」ではなく「徒歩が圧倒的に速い」ケースなので値に敏感でない。
+WALK_BEATS_BUS_MARGIN = 1
 
 # カテゴリチップのキー → stores の分類条件（DB設計書9章#12・2026-07-28 確定）。
 # 値は**固定の SQL 断片**で、キーはホワイトリスト検証を通ったものしか使わない（注入経路なし）。
@@ -167,6 +184,25 @@ def _best_by_store(reach_rows, nearby: dict[int, int], walk_max: int, ride_max: 
         if cur is None or (total, w1) < (cur["total"], cur["walk1"]):
             best[r["store_id"]] = cand
     return best
+
+
+def walk_only_info(dist_m: float, total: int, walk_max: int) -> dict | None:
+    """徒歩の方が速ければ `{minutes, distance_m}`、そうでなければ None。
+
+    条件は2つ。
+      1) `direct_walk + WALK_BEATS_BUS_MARGIN <= total` … 推定が実測にマージン込みで勝つ
+      2) `direct_walk <= walk_max` … **ユーザーの歩き上限を超えない**
+         上限超過でも徒歩に置き換えると「歩かない」設定を破る。実測では no_walk で
+         衝突0件・全体でも3件（うち2件は total と同値でマージンが弾く）なので、
+         バス経路のまま残しても失うものはほぼ無い。
+
+    distance_m を返すのは、表示で「歩いて3分（約280m）」と距離を併記して**断定を避ける**
+    ため（minutes は直線近似の推定値なので、迂回の大きい地形では外れる）。
+    """
+    direct = _walk_min(dist_m)
+    if direct + WALK_BEATS_BUS_MARGIN <= total and direct <= walk_max:
+        return {"minutes": direct, "distance_m": int(round(dist_m))}
+    return None
 
 
 @router.get("/api/search")
@@ -289,9 +325,24 @@ def search(
             ).mappings():
                 photo_by_store[row["store_id"]] = {"source": row["source"], "ref": None}  # SAS未発行=#14
 
-    # items 組み立て（total → walk1 → store_id 昇順）
+    # 徒歩の方が速い店を先に判定する（ソートキーに使うため items 組み立ての前に置く）
+    for b in best.values():
+        r = b["row"]
+        b["walk_only"] = walk_only_info(
+            _haversine_m(lat, lng, r["store_lat"], r["store_lng"]), b["total"], walk_max
+        )
+
+    def _effective_min(b: dict) -> int:
+        """並び替えに使う所要。徒歩の方が速い店はその時間で並べる。
+
+        バスを待つより歩く方が楽＝「楽な順」というプロダクトの主張どおり。本番実測では
+        37件が繰り上がり、最大で 6位→1位（練馬駅・ラーメン見田家＝バス3分／徒歩1分）。
+        """
+        return b["walk_only"]["minutes"] if b["walk_only"] else b["total"]
+
+    # items 組み立て（実効所要 → walk1 → store_id 昇順）
     items = []
-    for store_id, b in sorted(best.items(), key=lambda kv: (kv[1]["total"], kv[1]["walk1"], kv[0])):
+    for store_id, b in sorted(best.items(), key=lambda kv: (_effective_min(kv[1]), kv[1]["walk1"], kv[0])):
         r = b["row"]
         # own/user（ref は SAS 未実装のため None）→ 無ければ none。
         # hotpepper_url は画像URLではないので使わない（上の docstring 5 参照）。
@@ -311,6 +362,11 @@ def search(
             # 「本数少なめ」＝土日昼の便数がしきい値未満。除外はせずバッジで開示する（引き継ぎ資料4章）。
             # min_trip_count が NULL（バッチ未実行）のときは false＝バッジを出さない側に倒す。
             "few_trips": r["min_trip_count"] is not None and r["min_trip_count"] < FEW_TRIPS_THRESHOLD,
+            # 徒歩の方が速いとき {minutes, distance_m}、そうでなければ null。
+            # バス経路（raku・boarding_stop・route_label）は**消さずにそのまま返す**。
+            "walk_only": b["walk_only"],
+            # B-6 は条件を満たす経路しか返さないので常に null（型を B-7 と揃えるため置く）。
+            "out_of_conditions": None,
             "boarding_stop": r["boarding_name"],
             "alight_stop": r["alight_name"],
             "route_label": r["route_label"],

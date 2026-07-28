@@ -12,9 +12,16 @@
     だったが、直後の「ここ行く」が宣言時点の起点を記録できるようにするため。GET が書くのは
     A-8「GET は冪等」の例外だが、同じ依存が既に last_seen_at を更新している前例に沿う）。
 
-※「半径R」について: B-7 は walk_max 等の条件を取らないため設計書に R の定義が無い（記載なし）。
-  当該店の reach 行は少数のため、**候補を半径で絞らず全 boarding_stop から最小 total を選ぶ**
+※「半径R」について: B-7 はクエリで条件を取らないため設計書に R の定義が無い（記載なし）。
+  当該店の reach 行は少数のため、**候補を半径で絞らず全 boarding_stop から選ぶ**
   （R は B-6 での候補絞り最適化であり、最小 total の正しさには不要）。
+※【2026-07-28 修正】ただし**楽条件は適用する**。それまで walk_max/ride_max/total_max/transfer を
+  一切見ずに最小 total を選んでいたため、**S2 と S3 で所要時間が食い違っていた**
+  （本番実測: 同じ店が S2 で「歩10＋バス15＝29分（直行）」、S3 で「歩0＋バス14＝18分（乗換1回）」。
+  18分の経路は balance の transfer=none が除外していたものを S3 だけが拾っていた）。
+  条件はクエリではなく `user_conditions` から読む（API契約・フロントを変えずに済むため）。
+  条件を満たす経路が1件も無いときは条件なしで最良を返し `out_of_conditions` を立てる
+  （A-2 方式。マイリスト/お気に入りから開いた店の情報を失わないため）。
 ※lat/lng の範囲チェック(400)は B-7 の error 節に明記が無いが、B-6 と整合させて実装（下記コメント）。
 """
 from __future__ import annotations
@@ -28,9 +35,15 @@ from app.services import origin as origin_service
 # 徒歩式・座標妥当域は B-6 と同一のものを再利用（walk1 計算の一貫性を担保）
 from app.routers.search import (
     FEW_TRIPS_THRESHOLD, LAT_MAX, LAT_MIN, LNG_MAX, LNG_MIN, _haversine_m, _walk_min,
+    walk_only_info,
 )
 
 router = APIRouter()
+
+# walk_only の歩き上限のフォールバック。通常は user_conditions.walk_max を使うので、
+# これが効くのは**楽条件が未設定のユーザー**だけ（初回は /setup へ飛ぶので実質起きない）。
+# 値はプリセット最大の 20分（far_ok の walk_max）。
+WALK_ONLY_MAX_MIN = 20
 
 
 @router.get("/api/stores/{store_id}")
@@ -73,13 +86,56 @@ def get_store(
         if not rows:
             raise HTTPException(status_code=404, detail="store not found or not available")
 
-        # 現在地からの最小 total（同点は walk1 昇順）を全 boarding_stop から選ぶ
-        best = None
+        # ユーザーの楽条件を読む（2026-07-28 追加）。B-6 と同じ条件で選ばないと
+        # **S2 と S3 で所要時間が食い違う**（本番で発覚：同じ店が S2 29分／S3 18分。
+        # 18分の経路は乗換1回で、balance の transfer=none では S2 が除外していた）。
+        cond = conn.execute(
+            text(
+                """
+                SELECT walk_max, ride_max, total_max, transfer
+                FROM user_conditions WHERE user_id = :uid
+                """
+            ),
+            {"uid": session.uid},
+        ).mappings().first()
+
+        # 現在地からの最小 total（同点は walk1 昇順）を選ぶ。
+        # **まず条件を満たす経路から選び**、1つも無ければ条件なしで選び直して
+        # out_of_conditions を立てる（A-2 方式・2026-07-28 ibes 判断）。
+        # 条件外でも返すのは、マイリスト/お気に入りから開いた店の情報を失わないため
+        # （マイリストは掲載フィルタをかけない＝B-11 v1.3確定 と同じ思想）。
+        def pick(rs):
+            b = None
+            for r in rs:
+                w1 = _walk_min(_haversine_m(lat, lng, r["b_lat"], r["b_lng"]))
+                total = w1 + r["ride_min"] + r["walk2_min"]
+                if b is None or (total, w1) < (b["total"], b["walk1"]):
+                    b = {"row": r, "walk1": w1, "total": total}
+            return b
+
+        def violations(r, w1, total):
+            """この経路が破っている条件。条件未設定なら空（＝判定しない）。"""
+            if not cond:
+                return {}
+            return {
+                "transfer": cond["transfer"] == "none" and r["transfer"] != "none",
+                "walk": w1 + r["walk2_min"] > cond["walk_max"],
+                "ride": r["ride_min"] > cond["ride_max"],
+                "total": total > cond["total_max"],
+            }
+
+        ok = []
         for r in rows:
             w1 = _walk_min(_haversine_m(lat, lng, r["b_lat"], r["b_lng"]))
-            total = w1 + r["ride_min"] + r["walk2_min"]
-            if best is None or (total, w1) < (best["total"], best["walk1"]):
-                best = {"row": r, "walk1": w1, "total": total}
+            if not any(violations(r, w1, w1 + r["ride_min"] + r["walk2_min"]).values()):
+                ok.append(r)
+
+        best = pick(ok) if ok else pick(rows)
+        out_of_conditions = None
+        if not ok:
+            v = violations(best["row"], best["walk1"], best["total"])
+            if any(v.values()):
+                out_of_conditions = v
 
         # photo: store_photos(approved/is_primary) → none（SAS発行は#14で後日・ref=None）
         # ※hotpepper_url は「店ページ」のURLで画像ではないため photo.ref には使わない
@@ -122,6 +178,15 @@ def get_store(
         },
         # B-6 と同じ判定（few_trips の意味は search.py のコメント参照）
         "few_trips": row["min_trip_count"] is not None and row["min_trip_count"] < FEW_TRIPS_THRESHOLD,
+        # 徒歩の方が速いとき {minutes, distance_m}（B-6 と同じ walk_only_info）。
+        # 歩き上限は**ユーザーの walk_max**を使う（未設定時のみ WALK_ONLY_MAX_MIN）。
+        "walk_only": walk_only_info(
+            _haversine_m(lat, lng, row["store_lat"], row["store_lng"]),
+            best["total"], cond["walk_max"] if cond else WALK_ONLY_MAX_MIN,
+        ),
+        # いまの楽条件を満たさない経路を返しているとき、破っている条件を立てる。
+        # 満たしているとき（＝S2と一致するとき）は null。
+        "out_of_conditions": out_of_conditions,
         "boarding_stop": row["boarding_name"],
         "alight_stop": row["alight_name"],
         "route_label": row["route_label"],
