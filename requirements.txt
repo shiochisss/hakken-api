@@ -1,13 +1,16 @@
-fastapi
-uvicorn[standard]
-gunicorn
-sqlalchemy
-psycopg[binary]
-python-dotenv
-httpx
+fastapi==0.140.7
+uvicorn[standard]==0.51.0
+gunicorn==26.0.0
+sqlalchemy==2.0.51
+psycopg[binary]==3.3.4
+python-dotenv==1.2.2
+httpx==0.28.1
 # --- F11 写真アップロード（B-16）で追加 ---
-python-multipart
-pillow
-pillow-heif
-azure-storage-blob
-azure-identity
+python-multipart==0.0.32
+pillow==12.3.0
+pillow-heif==1.5.0
+azure-storage-blob==12.30.0
+azure-identity==1.25.3
+# cryptography: azure-identity経由の間接依存が上限バージョン制約なしのため明示ピン留め
+# (CVE-2026-69247 Timing Attack対応、Snyk SNYK-PYTHON-CRYPTOGRAPHY-18516621)
+cryptography>=50.0.0
