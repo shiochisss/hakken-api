@@ -47,6 +47,7 @@ from app.deps import CurrentSession, get_current_session
 # 従来名 _haversine_m / EARTH_R_M で再公開しているので stores.py・arrival.py・テストは無変更。
 from app.geo import EARTH_R_M, haversine_m as _haversine_m
 from app.services import origin as origin_service
+from app.services.limits import validate_raku_max
 # 「本数少なめ」のしきい値は生成側（バッチ）に定義がある。二重定義を避けて import する。
 from batch.route_segments import FEW_TRIPS_THRESHOLD
 
@@ -217,16 +218,21 @@ def search(
     preview: str | None = Query(None),
     session: CurrentSession = Depends(get_current_session),
 ):
-    # バリデーション（違反は 400）。上限は設けない（大きな値でもクエリは破綻しない）。
+    # バリデーション（違反は 400）。
     if transfer not in _TRANSFERS:
         raise HTTPException(status_code=400, detail="invalid transfer")
     # category はホワイトリスト（B-6）。未知のキーを黙って「すべて」に落とすと、
     # 絞れていないのに絞れたように見えて気付けないため 400 にする。
     if category is not None and category not in _CATEGORY_SQL:
         raise HTTPException(status_code=400, detail="invalid category")
-    for _name, _v in (("walk_max", walk_max), ("ride_max", ride_max), ("total_max", total_max)):
-        if _v < 1:
-            raise HTTPException(status_code=400, detail=f"{_name} must be >= 1")
+    # walk_max/ride_max/total_max の下限・上限。上限は v1.7 で追加（それまでは「大きな値
+    # でもクエリは破綻しない」という理由で上限を設けていなかったが、イタズラで巨大な値を
+    # 送りクエリ負荷をかけることを防ぐため転換。B-5（条件保存）と同じ上限を共有する
+    # ＝app/services/limits.py。API設計書 B-6 参照。
+    try:
+        validate_raku_max(walk_max, ride_max, total_max)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not (LAT_MIN <= lat <= LAT_MAX):
         raise HTTPException(status_code=400, detail="lat out of range")
     if not (LNG_MIN <= lng <= LNG_MAX):

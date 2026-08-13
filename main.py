@@ -20,7 +20,19 @@ from app.routers import (
     submissions,
 )
 
-app = FastAPI(title="ハッケンバス API")
+# Swagger UI（/docs）・ReDoc（/redoc）・OpenAPIスキーマ（/openapi.json）は
+# ENABLE_API_DOCS が true のときだけ公開する（既定 false＝非公開。API設計書 A-11）。
+# 未設定でも非公開側に倒れるフェイルセーフ設計＝Azure側の設定漏れで本番公開される事故を防ぐ。
+_docs_url = "/docs" if config.ENABLE_API_DOCS else None
+_redoc_url = "/redoc" if config.ENABLE_API_DOCS else None
+_openapi_url = "/openapi.json" if config.ENABLE_API_DOCS else None
+
+app = FastAPI(
+    title="ハッケンバス API",
+    docs_url=_docs_url,
+    redoc_url=_redoc_url,
+    openapi_url=_openapi_url,
+)
 
 # フロント（別オリジン）から Cookie 付きで叩くため、CORS は資格情報許可＋明示 origin。
 # ワイルドカード（*）は allow_credentials と併用不可。
