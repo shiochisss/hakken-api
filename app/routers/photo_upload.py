@@ -21,6 +21,7 @@ from app.services.photo_service import (
     PhotoUploadFailedError,
     PhotoUploadService,
 )
+from app.services.rate_limit import check_photo_upload_rate_limit
 from app.storage.base import BlobStoragePort
 from app.storage.dependency import get_blob_storage
 
@@ -54,7 +55,12 @@ async def upload_photo(
 ) -> PhotoUploadOut:
     # store_id は数値として正常だが存在しない場合のみ404（型/形式不正はForm(...)の
     # 自動バリデーションにより422→main.pyのハンドラで400になる）。
+    # 連投レート制限（API設計書 A-10）を最初に判定する。ファイル読み込み・画像処理
+    # （EXIF除去・リサイズ）・Blob書き込みより前に打ち切ることで、超過分の処理コスト・
+    # Azure Blobの課金を発生させない。
     with engine.begin() as conn:
+        if not check_photo_upload_rate_limit(conn, uid):
+            raise HTTPException(status_code=429, detail="too many photo uploads")
         if not store_exists(conn, store_id):
             raise HTTPException(status_code=404, detail="store_id not found")
 

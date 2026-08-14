@@ -62,8 +62,8 @@ gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app --forwarded-allow-ips="*
 
 | URL | 表示 |
 |---|---|
-| http://127.0.0.1:8000/docs | **Swagger UI**（APIの一覧・お試し実行画面） |
-| http://127.0.0.1:8000/health | `{"status":"ok"}`（生存確認） |
+| http://127.0.0.1:8000/docs | **Swagger UI**（APIの一覧・お試し実行画面）。**`.env` に `ENABLE_API_DOCS=true` が無いと404**（既定は非公開＝API設計書 A-11） |
+| http://127.0.0.1:8000/health | `{"status":"ok"}`（生存確認。`ENABLE_API_DOCS` の影響を受けない） |
 
 ## エンドポイント一覧
 
@@ -75,18 +75,18 @@ gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app --forwarded-allow-ips="*
 | POST | `/auth/logout` | セッション破棄→204（F1・B-3） |
 | GET | `/api/me` | ログイン中ユーザー`{id,email,has_conditions}`／未ログインは401（F1・B-1） |
 | GET | `/api/conditions` | 楽条件を取得。未設定は404（F3・B-4） |
-| PUT | `/api/conditions` | 楽条件をUPSERT保存し保存後の値を返す（F3・B-5） |
+| PUT | `/api/conditions` | 楽条件をUPSERT保存し保存後の値を返す。`walk_max`≤60／`ride_max`≤90／`total_max`≤150（超過は400・F3・B-5） |
 | POST | `/api/favorites` | お気に入り追加（重複は冪等・204）（F6・B-8） |
 | DELETE | `/api/favorites/{store_id}` | お気に入り解除（未登録も冪等・204）（F6・B-9） |
-| GET | `/api/search` | 逆引き検索。楽な順に店を返す＋`meta.origin`（起点の住所）（F4・B-6） |
+| GET | `/api/search` | 逆引き検索。楽な順に店を返す＋`meta.origin`（起点の住所）。`walk_max`≤60／`ride_max`≤90／`total_max`≤150（超過は400・F4・B-6） |
 | GET | `/api/stores/{store_id}` | 店詳細（現在地からの楽さ内訳込み）（F4・B-7） |
 | POST | `/api/going` | 「ここ行く」登録＋`koko_iku`計測→`{going_id}`（F7・B-10） |
 | GET | `/api/mylist` | マイリスト（行く予定／お気に入り）（F7・B-11） |
 | POST | `/api/going/{going_id}/arrived` | 着いたよ。150m以内→`verified`／遠い→`pending`（F8・B-12） |
 | GET | `/api/arrival-banner` | 着いたバナー照合。該当なしは`null`（F8b・B-13） |
 | POST | `/api/events` | 計測イベントを`event_log`へ追記→204（B-14） |
-| POST | `/api/submissions` | たれ込み投稿を`pending`で受付→`{submission_id}`（F11・B-15） |
-| POST | `/api/submissions/photo-upload` | たれ込み写真を非公開Blobへ→`{photo_id}`（F11・B-16） |
+| POST | `/api/submissions` | たれ込み投稿を`pending`で受付→`{submission_id}`。**同一ユーザー10分5件を超えると429**（F11・B-15） |
+| POST | `/api/submissions/photo-upload` | たれ込み写真を非公開Blobへ→`{photo_id}`。**同一ユーザー1時間10枚 かつ 1日30枚を超えると429**（F11・B-16） |
 
 ※**API設計書（B-1〜B-16）の全エンドポイントを実装済み**（2026-07-26 に B-12/B-13 を追加して完了）。B-17 は運営の手動DB操作でありオンラインAPIは無い。
 

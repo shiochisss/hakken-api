@@ -21,6 +21,7 @@ from app.deps import get_current_uid
 from app.repositories.stores_repo import store_exists
 from app.repositories.submissions_repo import insert_submission
 from app.schemas.submission import SubmissionIn, SubmissionOut
+from app.services.rate_limit import check_submissions_rate_limit
 
 router = APIRouter()
 
@@ -32,6 +33,10 @@ def create_submission(
     engine: Engine = Depends(get_engine),
 ) -> SubmissionOut:
     with engine.begin() as conn:
+        # 連投レート制限（API設計書 A-10）。INSERTより前に判定して打ち切る。
+        if not check_submissions_rate_limit(conn, uid):
+            raise HTTPException(status_code=429, detail="too many submissions")
+
         if body.store_id is not None and not store_exists(conn, body.store_id):
             raise HTTPException(status_code=404, detail="store_id not found")
 

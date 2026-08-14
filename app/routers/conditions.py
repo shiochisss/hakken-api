@@ -11,13 +11,16 @@ from sqlalchemy import text
 
 from app.db import get_engine
 from app.deps import get_current_uid
+from app.services.limits import validate_raku_max
 
 router = APIRouter()
 
 _TRANSFERS = {"none", "hub1"}
 _PRESETS = {"no_walk", "balance", "far_ok", "custom"}
-# 各上限の許容範囲は設計書 B-5 で TBD。DB は正の整数想定のため広めの健全域で受ける。
-_MIN, _MAX = 1, 240
+# 各上限の許容範囲（UIプリセットの具体値）は設計書 B-5 で TBD。ここでのセキュリティ上限
+# （walk_max/ride_max/total_max の下限・上限）は B-6（検索）と共有する
+# ＝app/services/limits.py（v1.7）。片方だけ緩いと「条件保存は通るのに検索は400」に
+# なるため一元管理する。
 
 
 class ConditionsIn(BaseModel):
@@ -30,9 +33,7 @@ class ConditionsIn(BaseModel):
 
 def validate_conditions(c: "ConditionsIn") -> None:
     """ドメイン検証。違反は ValueError（呼び出し側で 400 に変換）。"""
-    for name, v in (("walk_max", c.walk_max), ("ride_max", c.ride_max), ("total_max", c.total_max)):
-        if not (_MIN <= v <= _MAX):
-            raise ValueError(f"{name} out of range")
+    validate_raku_max(c.walk_max, c.ride_max, c.total_max)
     if c.transfer not in _TRANSFERS:
         raise ValueError("invalid transfer")
     if c.preset_key not in _PRESETS:

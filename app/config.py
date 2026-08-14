@@ -29,6 +29,12 @@ GOOGLE_SCOPE = "openid email"
 # --- フロント連携（CORS / next 許可 / 既定リダイレクト先）---
 FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000")
 
+# --- APIドキュメント（Swagger UI / ReDoc / OpenAPI）の公開制御（API設計書 A-11）---
+# 既定 false＝非公開（フェイルセーフ）。本番で /docs 等が誰でも閲覧できる状態
+# （エンドポイント一覧・スキーマという「カンニングペーパー」）を防ぐ。
+# ローカル開発は .env に ENABLE_API_DOCS=true を設定して有効化する。
+ENABLE_API_DOCS = os.environ.get("ENABLE_API_DOCS", "false").lower() == "true"
+
 # --- セッション / Cookie ---
 SESSION_COOKIE_NAME = "hakken_session"
 STATE_COOKIE_NAME = "oauth_state"
