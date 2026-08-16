@@ -98,15 +98,21 @@ gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app --forwarded-allow-ips="*
 - CSRF：`state` Cookie 照合。オープンリダイレクト防止：`next` は `FRONTEND_ORIGIN` 同一originのみ許可。
 - **DBマイグレーション**：`schema_postgres.sql`（docs）適用後に `db/001_sessions.sql` を流す（`users(id)`参照のため順序必須）。稼働中のDBに列を足すときは `db/002_origin_columns.sql`（001 は `DROP TABLE` するので流さない）。
 - **Azure（本番）注意**：TLSはプロキシ終端のため、Secure Cookie/scheme判定に `--proxy-headers`（uvicorn）等を有効化する（実際の設定は「起動方法 → 本番起動（Azure App Service）」節参照）。
-- **⚠ cross-site Cookie の制約（既知の制限）**：本番はフロント（`*.azurestaticapps.net`）と
-  API（`*.azurewebsites.net`）が**別サイト**なので、セッションCookieはサードパーティCookie扱いになる。
-  サーバは `SameSite=None; Secure` ＋ `Access-Control-Allow-Credentials: true` ＋ origin明示を
-  正しく返している（2026-07-28 に本番で実測確認）が、**Safari は third-party cookie を全面ブロック
-  するため `SameSite=None` は効かない**（`SameSite` は「送ってよい」という許可の表明にすぎない）。
-  そのため **Safari（iOS/macOS）・Firefox・Brave では全ての `/api/*` が401**になり、Chrome でも
-  「サードパーティCookieをブロック」設定なら同じ。**実装では回避できない**。
-  → **動作確認は Chrome／Edge に限定される。** 根本対応は独自ドメインでフロント・APIを同一サイトに
-  揃えること（時期未定）。詳細と対応案は画面設計書 A-9。
+- **cross-site Cookie の制約は解消済み（2026-08-15・BFF導入）**：v1.7 までは本番のフロント
+  （`*.azurestaticapps.net`）と API（`*.azurewebsites.net`）が**別サイト**で、セッションCookieが
+  サードパーティCookie扱いとなり、**Safari（iOS/macOS）・Firefox・Brave では全ての `/api/*` が401**
+  になっていた（`SameSite=None; Secure` は Safari では効かない＝実装で回避不可）。
+  **フロント側に BFF（Next.js の Route Handlers による中継）を入れ、ブラウザから見て同一オリジンに
+  なったため解消**。`iPhone Safari でのログイン〜検索〜マイリストを実測確認済み（2026-08-15）`。
+  → **動作確認は Chrome／Edge に限定されない。** 設計は API設計書 A-12／画面設計書 A-9。
+- **本APIのコードは BFF 導入で変更していない**（変わったのは環境変数2つのみ）:
+  - `OAUTH_REDIRECT_URI` … フロントのドメイン（`https://（フロント）/auth/google/callback`）
+  - `SESSION_COOKIE_SAMESITE` … `none` → `lax`
+  CORS（`FRONTEND_ORIGIN` 明示・`allow_credentials`）は BFF 経由では使われないが、
+  切り戻しの保険として**残している**。
+- **ブラウザから見たパスは `/auth/logout` ではなく `/api/auth/logout`**（Azure Static Web Apps の
+  ハイブリッドNext.jsが `/api/` 配下でないパスへの非GETを405で弾くため。Azure/static-web-apps#1132）。
+  **API側のルーティングは `/auth/logout` のまま**で、フロントの中継がパスを付け替えている。
 - テスト：`python -m tests.test_auth`（DB/Google非依存の到達パス＋純関数）。
 
 ## 夜間バッチ（F9：バス停DB生成）
